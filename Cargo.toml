@@ -1,0 +1,17 @@
+[package]
+name = "r2factor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+syn = { version = "2", features = ["full", "extra-traits", "visit"] }
+tokensave = { path = "/Users/pierre/src/tokensave/tokensave" }
+tokensave-large-treesitters = { path = "/Users/pierre/src/tokensave/tokensave-large-treesitters" }
+tokio = { version = "1", features = ["rt", "macros"] }
+ureq = { version = "2", features = ["json"] }
