@@ -50,16 +50,6 @@ pub struct ParsedItem {
 }
 
 impl ParsedItem {
-    pub fn anchor_type(&self) -> Option<&str> {
-        match &self.kind {
-            ItemKind::Impl { self_ty, .. } => Some(self_ty.as_str()),
-            ItemKind::Struct | ItemKind::Enum | ItemKind::Union | ItemKind::Trait => {
-                Some(self.name.as_str())
-            }
-            _ => None,
-        }
-    }
-
     pub fn is_data_kind(&self) -> bool {
         matches!(
             self.kind,

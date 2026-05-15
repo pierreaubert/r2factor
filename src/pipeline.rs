@@ -1,0 +1,124 @@
+//! End-to-end orchestration: parse → annotate → plan → optional LLM advice
+//! → dry-run print → optional write. Kept out of `lib.rs` so the entry
+//! function stays focused on options and the module tree.
+
+use crate::SplitOptions;
+use crate::graph;
+use crate::item::{self, ParsedItem};
+use crate::llm::{self, AdvisorOutcome, LlmConfig};
+use crate::plan::{self, Plan};
+use crate::tokensave::{CrossFileEvidence, Tokensave};
+use crate::write::{self, WriteReport};
+use anyhow::Result;
+use std::path::Path;
+
+pub fn run_split(path: &Path, opts: SplitOptions) -> Result<()> {
+    let src = std::fs::read_to_string(path)?;
+    let mut items = item::parse_file(&src)?;
+
+    let evidence = if opts.use_tokensave {
+        load_evidence(path, &items)
+    } else {
+        None
+    };
+
+    graph::annotate_refs(&mut items, evidence.as_ref());
+    let mut plan = plan::build(&items);
+
+    if let Some(cfg) = &opts.llm {
+        plan = run_llm(cfg, plan, &items);
+    }
+
+    plan::print_dry_run(&plan, &items);
+
+    if let Some(write_opts) = opts.write {
+        let report = write::write_plan(path, &plan, &items, &write_opts)?;
+        report_write(&report);
+    }
+
+    Ok(())
+}
+
+fn load_evidence(path: &Path, items: &[ParsedItem]) -> Option<CrossFileEvidence> {
+    let root = match Tokensave::locate(path) {
+        Some(root) => root,
+        None => {
+            eprintln!("[tokensave] no .tokensave/ found above {}", path.display());
+            return None;
+        }
+    };
+    let ts = match Tokensave::open(&root) {
+        Ok(ts) => ts,
+        Err(e) => {
+            eprintln!("[tokensave] open failed: {e}");
+            return None;
+        }
+    };
+    match ts.evidence_for_file(path, items) {
+        Ok(ev) => {
+            eprintln!(
+                "[tokensave] using {} ({} items with intra-file callees)",
+                root.display(),
+                ev.intra_file_callees.len(),
+            );
+            Some(ev)
+        }
+        Err(e) => {
+            eprintln!("[tokensave] evidence query failed: {e}");
+            None
+        }
+    }
+}
+
+fn run_llm(cfg: &LlmConfig, plan: Plan, items: &[ParsedItem]) -> Plan {
+    match llm::advise(cfg, &plan, items) {
+        Ok(outcome) => {
+            report_llm(&outcome);
+            outcome.plan
+        }
+        Err(e) => {
+            eprintln!("[llm] advisor failed, keeping deterministic plan: {e}");
+            plan
+        }
+    }
+}
+
+fn report_llm(outcome: &AdvisorOutcome) {
+    if outcome.applied_renames.is_empty() && outcome.applied_moves.is_empty() {
+        eprintln!("[llm] no changes proposed");
+    } else {
+        eprintln!(
+            "[llm] applied {} rename(s), {} move(s)",
+            outcome.applied_renames.len(),
+            outcome.applied_moves.len()
+        );
+        for (old, new) in &outcome.applied_renames {
+            eprintln!("[llm] rename {old} -> {new}");
+        }
+        for (id, from, to) in &outcome.applied_moves {
+            eprintln!("[llm] move id={id} {from} -> {to}");
+        }
+    }
+    if !outcome.rejected.is_empty() {
+        eprintln!("[llm] rejected {} suggestion(s):", outcome.rejected.len());
+        for r in &outcome.rejected {
+            eprintln!("  - {r}");
+        }
+    }
+}
+
+fn report_write(report: &WriteReport) {
+    eprintln!();
+    eprintln!("[write] backup -> {}", report.backup.display());
+    match &report.target_dir {
+        Some(dir) => eprintln!("[write] target -> {}/", dir.display()),
+        None => eprintln!("[write] target -> (no sub-files; everything inlined in facade)"),
+    }
+    for f in &report.written_files {
+        eprintln!("[write]   {}", f.display());
+    }
+    eprintln!("[write] facade -> {}", report.facade.display());
+    eprintln!(
+        "[write] run `cargo check` next; private items used cross-bucket may need pub(super) promotion."
+    );
+}

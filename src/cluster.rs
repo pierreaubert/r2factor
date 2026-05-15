@@ -1,4 +1,5 @@
 use crate::item::{ItemId, ItemKind, ParsedItem};
+use crate::names::type_to_module_name;
 use crate::plan::Plan;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -172,35 +173,3 @@ fn collapse_singletons(
     out
 }
 
-fn type_to_module_name(ty: &str) -> String {
-    if ty == "misc" {
-        return "misc".to_string();
-    }
-    let mut out = String::with_capacity(ty.len() + 4);
-    let mut prev_lower = false;
-    for ch in ty.chars() {
-        if ch.is_ascii_uppercase() {
-            if prev_lower {
-                out.push('_');
-            }
-            out.push(ch.to_ascii_lowercase());
-            prev_lower = false;
-        } else {
-            out.push(ch);
-            prev_lower = ch.is_ascii_lowercase() || ch.is_ascii_digit();
-        }
-    }
-    out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn snake_cases_camel() {
-        assert_eq!(type_to_module_name("FooBar"), "foo_bar");
-        assert_eq!(type_to_module_name("HTTPClient"), "httpclient");
-        assert_eq!(type_to_module_name("Token"), "token");
-    }
-}
