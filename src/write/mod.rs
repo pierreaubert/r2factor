@@ -51,7 +51,7 @@ pub struct WriteOptions {
     pub force: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct WriteReport {
     pub backup: PathBuf,
     /// `None` when every bucket ended up in the facade (mod_root + primary)
@@ -82,7 +82,7 @@ pub fn write_plan(
     let original_src = fs::read_to_string(original)?;
     if is_r2factor_facade(&original_src) {
         bail!(
-            "refusing to split {}: it is already an r2factor facade. Run on the original source or restore from a .r2factor.bak.* backup.",
+            "refusing to split {}: it is already an r2factor facade. Run on the original source or restore from the `.bak` backup.",
             original.display()
         );
     }

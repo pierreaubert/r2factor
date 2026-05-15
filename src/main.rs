@@ -14,6 +14,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Run r2factor as an MCP (Model Context Protocol) server over stdio.
+    /// Lets an MCP-aware client (Claude Code, IDE extensions, etc.)
+    /// discover and call `split_dry_run` and `split_write` as tools.
+    Mcp,
     /// Propose how to split a single .rs file into a module of smaller files.
     Split {
         file: PathBuf,
@@ -46,6 +50,7 @@ enum Cmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
+        Cmd::Mcp => r2factor::mcp::serve(),
         Cmd::Split {
             file,
             no_tokensave,

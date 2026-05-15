@@ -1,14 +1,31 @@
 use super::Plan;
 use crate::item::{ItemId, ParsedItem};
+use serde::Serialize;
 use std::collections::BTreeMap;
 
-/// Walk `items[i].refs`, resolve each ref name to an item id, and count how
-/// many ref-edges stay inside their bucket vs cross to a different one.
-/// Reports a quick cohesion summary at the end of the dry-run so the user
-/// can judge whether the split is tight or fragmented before they accept
-/// it. The score is `intra / (intra + inter)` — 1.0 means every ref stays
-/// within its bucket, 0.0 means the split shredded the reference graph.
-pub fn report_cohesion(plan: &Plan, items: &[ParsedItem]) {
+/// JSON-friendly cohesion summary. `score = intra / (intra + inter)` —
+/// 1.0 means every ref stays inside its bucket, 0.0 means the split
+/// shredded the reference graph. `top_cross_edges` lists the heaviest
+/// `from -> to` bucket pairs (capped at 5) so callers can spot the
+/// buckets that should probably merge or share a visibility lift.
+#[derive(Debug, Clone, Serialize)]
+pub struct CohesionReport {
+    pub intra: usize,
+    pub inter: usize,
+    pub score: f64,
+    pub top_cross_edges: Vec<CrossEdge>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CrossEdge {
+    pub from: String,
+    pub to: String,
+    pub weight: usize,
+}
+
+/// Pure version of [`report_cohesion`] for callers that need the data
+/// instead of stdout.
+pub fn cohesion_report(plan: &Plan, items: &[ParsedItem]) -> CohesionReport {
     let bucket_of: BTreeMap<ItemId, &String> = plan
         .assignments
         .iter()
@@ -23,7 +40,6 @@ pub fn report_cohesion(plan: &Plan, items: &[ParsedItem]) {
     let mut intra: usize = 0;
     let mut inter: usize = 0;
     let mut inter_pairs: BTreeMap<(String, String), usize> = BTreeMap::new();
-
     for it in items {
         let Some(my_bucket) = bucket_of.get(&it.id) else {
             continue;
@@ -39,7 +55,6 @@ pub fn report_cohesion(plan: &Plan, items: &[ParsedItem]) {
                 intra += 1;
             } else {
                 inter += 1;
-                // Direction matters (a depends on b) so we keep ordered pairs.
                 let key = ((*my_bucket).clone(), (*target_bucket).clone());
                 *inter_pairs.entry(key).or_default() += 1;
             }
@@ -52,19 +67,33 @@ pub fn report_cohesion(plan: &Plan, items: &[ParsedItem]) {
     } else {
         intra as f64 / total as f64
     };
+    let mut heavy: Vec<((String, String), usize)> = inter_pairs.into_iter().collect();
+    heavy.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    let top_cross_edges = heavy
+        .into_iter()
+        .take(5)
+        .map(|((from, to), weight)| CrossEdge { from, to, weight })
+        .collect();
+    CohesionReport {
+        intra,
+        inter,
+        score,
+        top_cross_edges,
+    }
+}
 
+pub fn report_cohesion(plan: &Plan, items: &[ParsedItem]) {
+    let r = cohesion_report(plan, items);
     println!(
-        "cohesion: {intra} intra-bucket + {inter} cross-bucket refs (score {score:.2}; 1.0 = fully self-contained buckets)"
+        "cohesion: {intra} intra-bucket + {inter} cross-bucket refs (score {score:.2}; 1.0 = fully self-contained buckets)",
+        intra = r.intra,
+        inter = r.inter,
+        score = r.score,
     );
-    if !inter_pairs.is_empty() {
-        // Show the heaviest cross-bucket edges — these are the candidates
-        // for either merging the two buckets or lifting visibility.
-        let mut heavy: Vec<((String, String), usize)> = inter_pairs.into_iter().collect();
-        heavy.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
-        let show = heavy.iter().take(5);
+    if !r.top_cross_edges.is_empty() {
         println!("cohesion: top cross-bucket edges:");
-        for ((from, to), n) in show {
-            println!("  {n:>3}  {from} -> {to}");
+        for e in &r.top_cross_edges {
+            println!("  {:>3}  {} -> {}", e.weight, e.from, e.to);
         }
     }
     println!();

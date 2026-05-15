@@ -28,7 +28,7 @@ const RESERVED: &[&str] = &[
 /// `r#` through every emit site (mod decl, pub use, cross-imports) and
 /// readers would have to remember which buckets are raw.
 pub fn escape_keyword(name: &str) -> String {
-    if RESERVED.iter().any(|kw| *kw == name) {
+    if RESERVED.contains(&name) {
         format!("{name}_")
     } else {
         name.to_string()

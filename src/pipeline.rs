@@ -19,7 +19,7 @@ pub fn run_split(path: &Path, opts: SplitOptions) -> Result<()> {
     // previously-split sub-files. Detection rule lives in `write::`.
     if write::is_r2factor_facade(&src) {
         anyhow::bail!(
-            "refusing to operate on {}: it is an r2factor facade. Run on the original source or restore from a .r2factor.bak.* backup.",
+            "refusing to operate on {}: it is an r2factor facade. Run on the original source or restore from the `.bak` backup.",
             path.display()
         );
     }

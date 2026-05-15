@@ -10,8 +10,8 @@ use crate::item::ItemId;
 use std::collections::BTreeMap;
 
 pub use build::build;
-pub use cohesion::report_cohesion;
-pub use dry_run::print_dry_run;
+pub use cohesion::{CohesionReport, CrossEdge, cohesion_report, report_cohesion};
+pub use dry_run::{BucketReport, DryRunReport, ItemReport, dry_run_report, print_dry_run};
 
 #[derive(Default, Debug)]
 pub struct Plan {

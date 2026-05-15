@@ -3,6 +3,7 @@ pub mod cluster;
 pub mod graph;
 pub mod item;
 pub mod llm;
+pub mod mcp;
 pub mod names;
 pub mod pipeline;
 pub mod plan;
