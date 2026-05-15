@@ -6,6 +6,8 @@ pub mod llm;
 pub mod names;
 pub mod pipeline;
 pub mod plan;
+pub mod promote;
+pub mod refine;
 pub mod tokensave;
 pub mod write;
 

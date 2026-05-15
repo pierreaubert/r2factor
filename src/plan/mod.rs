@@ -3,12 +3,14 @@
 //! human-readable dry-run printer in [`dry_run`].
 
 mod build;
+mod cohesion;
 mod dry_run;
 
 use crate::item::ItemId;
 use std::collections::BTreeMap;
 
 pub use build::build;
+pub use cohesion::report_cohesion;
 pub use dry_run::print_dry_run;
 
 #[derive(Default, Debug)]

@@ -31,7 +31,14 @@ pub enum ItemKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ItemVis {
     Public,
+    /// `pub(crate)`
     Crate,
+    /// `pub(super)` — kept distinct from generic `Restricted` because the
+    /// splitter needs to rebase it when an item moves into a sub-bucket
+    /// (the module hierarchy gains a level, so `super` now points one
+    /// level less far up than the author intended).
+    Super,
+    /// Any other `pub(in path)` form we don't specialize.
     Restricted,
     Private,
 }
@@ -218,10 +225,10 @@ fn item_vis(item: &Item) -> ItemVis {
         Some(Visibility::Public(_)) => ItemVis::Public,
         Some(Visibility::Restricted(r)) => {
             let path = path_to_string(&r.path);
-            if path == "crate" {
-                ItemVis::Crate
-            } else {
-                ItemVis::Restricted
+            match path.as_str() {
+                "crate" => ItemVis::Crate,
+                "super" => ItemVis::Super,
+                _ => ItemVis::Restricted,
             }
         }
         Some(Visibility::Inherited) => ItemVis::Private,

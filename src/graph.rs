@@ -73,4 +73,46 @@ impl<'ast, 'a> Visit<'ast> for RefVisitor<'a> {
             self.found.insert(s);
         }
     }
+
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        // `syn` keeps macro contents as an opaque `TokenStream` since it
+        // doesn't expand macros, so the default visitor walks past every
+        // ident inside e.g. `vec![normalize(s)]`. Drop in a token-level
+        // scan so refs from inside macro calls aren't lost.
+        visit::visit_path(self, &mac.path);
+        scan_token_stream(&mac.tokens, self);
+    }
+}
+
+fn scan_token_stream(stream: &proc_macro2::TokenStream, v: &mut RefVisitor) {
+    use proc_macro2::TokenTree;
+    for tt in stream.clone() {
+        match tt {
+            TokenTree::Ident(id) => v.visit_ident(&id),
+            TokenTree::Group(g) => scan_token_stream(&g.stream(), v),
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::item::parse_file;
+
+    #[test]
+    fn refs_from_inside_macro_invocation_are_counted() {
+        // The fn body calls `normalize` from inside `vec![..]`. Without a
+        // token-stream walk, syn's default `Visit` skips the macro body
+        // and `helper` ends up with no refs.
+        let src = "fn normalize(s: &str) -> &str { s }\nfn helper() { let _ = vec![normalize(\"x\")]; }\n";
+        let mut items = parse_file(src).unwrap();
+        annotate_refs(&mut items, None);
+        let helper = items.iter().find(|i| i.name == "helper").unwrap();
+        assert!(
+            helper.refs.iter().any(|r| r == "normalize"),
+            "helper should ref normalize through the vec! macro; refs={:?}",
+            helper.refs
+        );
+    }
 }

@@ -18,15 +18,35 @@ pub fn carve_tests(items: &[ParsedItem], plan: &mut Plan, unassigned: &mut BTree
 
 /// `macro_rules!` definitions → `macros`. They must be defined before use,
 /// so consolidating them at the top of the module tree avoids order surprises.
+///
+/// IMPORTANT: only `macro_rules! name { ... }` items go here. Item-position
+/// *invocations* like `thread_local! { static FOO: ... }` parse as
+/// `Item::Macro` too but they *define* items (statics, types) via macro
+/// expansion. Moving them to a sub-bucket moves where those items live —
+/// siblings then fail to resolve `FOO`. We distinguish via the `name`
+/// field: macro_rules names its definition (ident Some); invocations
+/// don't, so r2factor leaves their `ParsedItem.name` empty.
 pub fn carve_macros(items: &[ParsedItem], plan: &mut Plan, unassigned: &mut BTreeSet<ItemId>) {
     for it in items {
         if !unassigned.contains(&it.id) {
             continue;
         }
-        if matches!(it.kind, ItemKind::Macro) {
-            plan.assign("macros", it.id, "macro_rules!");
-            unassigned.remove(&it.id);
+        if !matches!(it.kind, ItemKind::Macro) {
+            continue;
         }
+        if !it.name.is_empty() {
+            // `macro_rules! name { ... }` — bucket-able definition.
+            plan.assign("macros", it.id, "macro_rules!");
+        } else {
+            // Item-position macro invocation that defines via expansion
+            // (`thread_local!`, `lazy_static!`, `bitflags!`, …). The
+            // expansion's items live in whichever module the invocation
+            // lands in, so pin it to mod_root (the facade) — that
+            // preserves the original module scope for whatever the
+            // expansion declares.
+            plan.assign("mod_root", it.id, "macro invocation kept at module root");
+        }
+        unassigned.remove(&it.id);
     }
 }
 

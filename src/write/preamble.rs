@@ -1,20 +1,45 @@
+use syn::spanned::Spanned;
+
 /// Pull the leading inner-attribute / `//!` doc block from a source file.
-/// Stops at the first non-empty line that isn't `//!` or `#![...]`. Block
-/// comments and mixed outer comments aren't handled — the heuristic is
-/// intentionally simple because the result is only used to prefix the
-/// regenerated facade.
+/// Driven by `syn::parse_file` rather than a line-prefix heuristic so that
+/// multi-line attributes like
+///
+/// ```ignore
+/// #![allow(
+///     dead_code,
+///     unused_imports,
+/// )]
+/// ```
+///
+/// are preserved intact instead of being chopped at the first line that
+/// doesn't begin with `#![` or `//!`.
 pub fn extract_inner_attrs(src: &str) -> String {
-    let mut out = String::new();
-    for line in src.lines() {
-        let t = line.trim_start();
-        if t.is_empty() || t.starts_with("//!") || t.starts_with("#![") {
-            out.push_str(line);
-            out.push('\n');
-        } else {
-            break;
-        }
+    let file = match syn::parse_file(src) {
+        Ok(f) => f,
+        Err(_) => return String::new(),
+    };
+    let inner: Vec<&syn::Attribute> = file
+        .attrs
+        .iter()
+        .filter(|a| matches!(a.style, syn::AttrStyle::Inner(_)))
+        .collect();
+    if inner.is_empty() {
+        return String::new();
     }
-    out.trim_end().to_string()
+    // Slice up to (and including) the last line covered by an inner attr.
+    // proc_macro2 spans are 1-indexed.
+    let end_line = inner
+        .iter()
+        .map(|a| a.span().end().line)
+        .max()
+        .unwrap_or(0);
+    if end_line == 0 {
+        return String::new();
+    }
+    src.lines()
+        .take(end_line)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -38,5 +63,12 @@ mod tests {
     #[test]
     fn extract_inner_attrs_returns_empty_when_none() {
         assert_eq!(extract_inner_attrs("fn x(){}"), "");
+    }
+
+    #[test]
+    fn extract_inner_attrs_preserves_multiline() {
+        let src = "#![allow(\n    dead_code,\n    unused_imports\n)]\n\nfn x() {}";
+        let out = extract_inner_attrs(src);
+        assert_eq!(out, "#![allow(\n    dead_code,\n    unused_imports\n)]");
     }
 }

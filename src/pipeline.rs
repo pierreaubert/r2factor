@@ -14,6 +14,15 @@ use std::path::Path;
 
 pub fn run_split(path: &Path, opts: SplitOptions) -> Result<()> {
     let src = std::fs::read_to_string(path)?;
+    // Refuse early — feeding an r2factor facade back through the pipeline
+    // produces a degenerate plan that, if written, would delete the
+    // previously-split sub-files. Detection rule lives in `write::`.
+    if write::is_r2factor_facade(&src) {
+        anyhow::bail!(
+            "refusing to operate on {}: it is an r2factor facade. Run on the original source or restore from a .r2factor.bak.* backup.",
+            path.display()
+        );
+    }
     let mut items = item::parse_file(&src)?;
 
     let evidence = if opts.use_tokensave {
@@ -30,6 +39,7 @@ pub fn run_split(path: &Path, opts: SplitOptions) -> Result<()> {
     }
 
     plan::print_dry_run(&plan, &items);
+    plan::report_cohesion(&plan, &items);
 
     if let Some(write_opts) = opts.write {
         let report = write::write_plan(path, &plan, &items, &write_opts)?;

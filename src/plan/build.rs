@@ -2,6 +2,7 @@ use super::Plan;
 use crate::carve::{carve_consts, carve_errors, carve_macros, carve_tests, carve_types};
 use crate::cluster::cluster_remaining;
 use crate::item::{ItemId, ParsedItem};
+use crate::refine::pull_misc_by_calls;
 use std::collections::BTreeSet;
 
 /// One placement pass. All carves + the clusterer share this shape, which
@@ -20,6 +21,10 @@ pub const PASSES: &[(&str, Pass)] = &[
     ("consts", carve_consts),
     ("types", carve_types),
     ("cluster", cluster_remaining),
+    // Refinement: move misc items into the bucket their refs talk to most.
+    // Runs last because it depends on the cluster pass having placed every
+    // item somewhere first.
+    ("pull_misc_by_calls", pull_misc_by_calls),
 ];
 
 pub fn build(items: &[ParsedItem]) -> Plan {
