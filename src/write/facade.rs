@@ -1,6 +1,6 @@
 use super::FACADE_MARKER;
 use crate::item::{ItemId, ParsedItem};
-use crate::promote::{add_pub_super, lift_impl_methods};
+use crate::promote::{CrossImport, add_pub_super, lift_impl_methods};
 use std::collections::BTreeSet;
 use std::fmt::Write;
 
@@ -15,7 +15,7 @@ pub fn render_facade(
     sub_modules: &[String],
     promote: &BTreeSet<ItemId>,
     impl_lifts: &BTreeSet<ItemId>,
-    facade_imports: &BTreeSet<(String, String)>,
+    facade_imports: &BTreeSet<CrossImport>,
 ) -> String {
     let mut buf = String::new();
     if !inner_attrs.is_empty() {
@@ -75,8 +75,16 @@ pub fn render_facade(
     // exports `pub` items, so without these explicit lines the bare names
     // would fail to resolve at facade scope.
     if !facade_imports.is_empty() {
-        for (src_bucket, name) in facade_imports {
-            let _ = writeln!(buf, "use {src_bucket}::{name};");
+        for imp in facade_imports {
+            for cfg in &imp.cfg_attrs {
+                let _ = writeln!(buf, "{cfg}");
+            }
+            let _ = writeln!(
+                buf,
+                "use {src}::{name};",
+                src = imp.source_bucket,
+                name = imp.name
+            );
         }
         buf.push('\n');
     }

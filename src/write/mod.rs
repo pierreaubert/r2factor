@@ -11,9 +11,10 @@ mod uses;
 use crate::item::{ItemId, ItemKind, ParsedItem};
 use crate::plan::Plan;
 use crate::promote::{
-    RefContext, compute_cross_imports, compute_facade_imports, compute_impl_lifts,
-    compute_promotions,
+    CrossImport, RefContext, compute_cross_imports, compute_facade_imports, compute_field_lifts,
+    compute_impl_lifts, compute_promotions,
 };
+use std::collections::HashSet;
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -128,6 +129,19 @@ pub fn write_plan(
     // calls resolve. Without this, E0624 ("associated function ... is
     // private") fires on every promoted type that has an impl block.
     let impl_lifts: BTreeSet<ItemId> = compute_impl_lifts(&ctx, items, stem);
+    // Field-vis lift for *non-promoted* structs/unions in sub-buckets.
+    // Catches `pub struct` with private fields read cross-bucket (E0616).
+    let field_lifts: BTreeSet<ItemId> = compute_field_lifts(&ctx, items, &promote, stem);
+
+    // Bucket-name renames: a bucket whose name shadows something brought
+    // into facade scope (e.g. `fmt` colliding with `use std::fmt;`) would
+    // produce an E0255 ("name defined multiple times") at the `mod fmt;`
+    // emission. Detect collisions against the names imported by
+    // `mod_root` and append `_mod` to disambiguate.
+    let renames = compute_bucket_renames(plan, &all_uses, stem);
+    let assignments = rename_assignments(&plan.assignments, &renames);
+    let cross_imports = rename_cross_imports(cross_imports, &renames);
+    let facade_imports = rename_facade_imports(facade_imports, &renames);
 
     // 3) Sub-files.
     fs::create_dir_all(&target_dir)
@@ -138,7 +152,7 @@ pub fn write_plan(
     let mut facade_uses: Vec<&ParsedItem> = Vec::new();
     let mut facade_primary: Vec<&ParsedItem> = Vec::new();
 
-    for (module, ids) in &plan.assignments {
+    for (module, ids) in &assignments {
         if module == "mod_root" {
             for id in ids {
                 facade_uses.push(by_id[id]);
@@ -160,6 +174,7 @@ pub fn write_plan(
             &bucket_prelude,
             &promote,
             &impl_lifts,
+            &field_lifts,
             &imports,
         );
         fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
@@ -233,6 +248,113 @@ fn bucket_use_prelude(
         .map(|u| uses::rebase_use_for_subfile(&u.source))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Compute renames for sub-bucket names that collide with names already in
+/// the facade's scope. The collision matters at the `mod NAME;` emission —
+/// Rust forbids the same name appearing as both an imported item and a
+/// module in the same scope, so `use std::fmt;` + `mod fmt;` is E0255.
+///
+/// Facade buckets (`mod_root`, `tests`, the stem-named primary bucket) are
+/// never renamed: the stem-bucket items live in the facade itself, mod_root
+/// items don't materialize as their own module, and `tests` is a fixed
+/// well-known name.
+fn compute_bucket_renames(
+    plan: &Plan,
+    all_uses: &[&ParsedItem],
+    stem: &str,
+) -> BTreeMap<String, String> {
+    // Names brought into facade scope by `use` items that live in `mod_root`.
+    // We don't worry about cross-bucket imports here — those are emitted
+    // from inside sub-files where the bucket name doesn't collide with
+    // facade-level imports.
+    let mod_root_ids: BTreeSet<ItemId> = plan
+        .assignments
+        .get("mod_root")
+        .map(|v| v.iter().copied().collect())
+        .unwrap_or_default();
+    let mut imported: HashSet<String> = HashSet::new();
+    for u in all_uses {
+        if !mod_root_ids.contains(&u.id) {
+            continue;
+        }
+        for name in uses::use_bindings(u) {
+            imported.insert(name);
+        }
+    }
+    let mut renames: BTreeMap<String, String> = BTreeMap::new();
+    for bucket in plan.assignments.keys() {
+        if bucket == "mod_root" || bucket == stem || bucket == "tests" {
+            continue;
+        }
+        if imported.contains(bucket) {
+            renames.insert(bucket.clone(), format!("{bucket}_mod"));
+        }
+    }
+    renames
+}
+
+fn rename_assignments(
+    src: &BTreeMap<String, Vec<ItemId>>,
+    renames: &BTreeMap<String, String>,
+) -> BTreeMap<String, Vec<ItemId>> {
+    if renames.is_empty() {
+        return src.clone();
+    }
+    let mut out: BTreeMap<String, Vec<ItemId>> = BTreeMap::new();
+    for (bucket, ids) in src {
+        let key = renames.get(bucket).cloned().unwrap_or_else(|| bucket.clone());
+        out.entry(key).or_default().extend(ids.iter().copied());
+    }
+    out
+}
+
+fn rename_cross_imports(
+    src: BTreeMap<String, BTreeSet<CrossImport>>,
+    renames: &BTreeMap<String, String>,
+) -> BTreeMap<String, BTreeSet<CrossImport>> {
+    if renames.is_empty() {
+        return src;
+    }
+    let mut out: BTreeMap<String, BTreeSet<CrossImport>> = BTreeMap::new();
+    for (consumer, imports) in src {
+        let consumer_new = renames.get(&consumer).cloned().unwrap_or(consumer);
+        let entry = out.entry(consumer_new).or_default();
+        for c in imports {
+            let src_new = renames
+                .get(&c.source_bucket)
+                .cloned()
+                .unwrap_or(c.source_bucket);
+            entry.insert(CrossImport {
+                source_bucket: src_new,
+                name: c.name,
+                cfg_attrs: c.cfg_attrs,
+            });
+        }
+    }
+    out
+}
+
+fn rename_facade_imports(
+    src: BTreeSet<CrossImport>,
+    renames: &BTreeMap<String, String>,
+) -> BTreeSet<CrossImport> {
+    if renames.is_empty() {
+        return src;
+    }
+    src.into_iter()
+        .map(|c| {
+            let src_new = renames
+                .get(&c.source_bucket)
+                .cloned()
+                .unwrap_or(c.source_bucket);
+            CrossImport {
+                source_bucket: src_new,
+                name: c.name,
+                cfg_attrs: c.cfg_attrs,
+            }
+        })
+        .collect()
 }
 
 fn purge_stale_rs(dir: &Path) -> Result<()> {

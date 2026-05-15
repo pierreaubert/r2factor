@@ -9,7 +9,54 @@
 
 use crate::item::{ItemId, ItemVis, ParsedItem};
 use crate::plan::Plan;
+use quote::ToTokens;
 use std::collections::{BTreeMap, BTreeSet};
+
+/// Extract verbatim `#[cfg(...)]` attribute source from an item's source
+/// text. Used to gate cross-imports on the same cfg as the target item —
+/// without this, a `use super::misc::linux_only;` against a function
+/// defined `#[cfg(target_os = "linux")]` fails to resolve on every other
+/// platform.
+///
+/// Returns each cfg attr rendered as its source representation (e.g.
+/// `#[cfg(target_os = "linux")]`). Non-cfg attributes (`#[inline]`,
+/// `#[derive(...)]`, doc comments) are ignored.
+pub fn cfg_attrs_of(item_source: &str) -> Vec<String> {
+    let Ok(file) = syn::parse_file(item_source) else {
+        return Vec::new();
+    };
+    let Some(item) = file.items.first() else {
+        return Vec::new();
+    };
+    let attrs = item_outer_attrs(item);
+    attrs
+        .iter()
+        .filter(|a| a.path().is_ident("cfg"))
+        .map(|a| a.to_token_stream().to_string())
+        .collect()
+}
+
+fn item_outer_attrs(item: &syn::Item) -> &[syn::Attribute] {
+    use syn::Item;
+    match item {
+        Item::Const(i) => &i.attrs,
+        Item::Enum(i) => &i.attrs,
+        Item::ExternCrate(i) => &i.attrs,
+        Item::Fn(i) => &i.attrs,
+        Item::ForeignMod(i) => &i.attrs,
+        Item::Impl(i) => &i.attrs,
+        Item::Macro(i) => &i.attrs,
+        Item::Mod(i) => &i.attrs,
+        Item::Static(i) => &i.attrs,
+        Item::Struct(i) => &i.attrs,
+        Item::Trait(i) => &i.attrs,
+        Item::TraitAlias(i) => &i.attrs,
+        Item::Type(i) => &i.attrs,
+        Item::Union(i) => &i.attrs,
+        Item::Use(i) => &i.attrs,
+        _ => &[],
+    }
+}
 
 /// "Facade buckets" don't materialize as a sub-file — `mod_root` items get
 /// inlined into the facade's preamble, and the bucket whose name equals the
@@ -88,6 +135,29 @@ pub fn compute_promotions(
             }
         }
     }
+    // cfg-variant siblings: `#[cfg(unix)] fn foo` and `#[cfg(not(unix))] fn foo`
+    // are two ParsedItems sharing one name. `ctx.name_to_id` is a BTreeMap so
+    // only one survives — meaning `compute_promotions` may have lifted only
+    // one variant. Rustc picks whichever cfg-active variant exists at build
+    // time, so a single-variant lift fails roughly half the time. Expand the
+    // set so every variant of every promoted name is lifted in lockstep.
+    let promoted_names: BTreeSet<&str> = out
+        .iter()
+        .filter_map(|id| ctx.by_id.get(id).map(|it| it.name.as_str()))
+        .filter(|n| !n.is_empty())
+        .collect();
+    if !promoted_names.is_empty() {
+        for it in items {
+            if it.name.is_empty() || !promoted_names.contains(it.name.as_str()) {
+                continue;
+            }
+            // Same eligibility gate as above so we don't accidentally
+            // promote an item we wouldn't normally rewrite.
+            if it.vis == ItemVis::Private && needs_keyword_rewrite(it) {
+                out.insert(it.id);
+            }
+        }
+    }
     out
 }
 
@@ -96,19 +166,27 @@ pub fn compute_promotions(
 /// `pub(super)`-promoted items show up here — `pub` items in sibling
 /// buckets already reach A through the facade's `pub use <bkt>::*;`
 /// wildcard chain, and same-bucket items don't need imports.
+/// A single cross-bucket `use` line to emit: source bucket, item name, and
+/// any `#[cfg(...)]` attributes the use must carry so it stays in lockstep
+/// with the target item's gating.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CrossImport {
+    pub source_bucket: String,
+    pub name: String,
+    pub cfg_attrs: Vec<String>,
+}
+
 pub fn compute_cross_imports(
     ctx: &RefContext<'_>,
     items: &[ParsedItem],
     promote: &BTreeSet<ItemId>,
     stem: &str,
-) -> BTreeMap<String, BTreeSet<(String, String)>> {
-    let mut out: BTreeMap<String, BTreeSet<(String, String)>> = BTreeMap::new();
+) -> BTreeMap<String, BTreeSet<CrossImport>> {
+    let mut out: BTreeMap<String, BTreeSet<CrossImport>> = BTreeMap::new();
     for it in items {
         let Some(my_bucket) = ctx.bucket_of.get(&it.id) else {
             continue;
         };
-        // Facade-residing items emit their imports in the facade itself,
-        // not in a sub-file — handled by `compute_facade_imports`.
         if is_facade_bucket(my_bucket, stem) {
             continue;
         }
@@ -128,7 +206,11 @@ pub fn compute_cross_imports(
             let target = ctx.by_id[target_id];
             out.entry((*my_bucket).clone())
                 .or_default()
-                .insert(((*target_bucket).clone(), target.name.clone()));
+                .insert(CrossImport {
+                    source_bucket: (*target_bucket).clone(),
+                    name: target.name.clone(),
+                    cfg_attrs: cfg_attrs_of(&target.source),
+                });
         }
     }
     out
@@ -172,6 +254,164 @@ pub fn compute_impl_lifts(
             }
         })
         .collect()
+}
+
+/// IDs of structs/unions in sub-buckets that aren't already covered by
+/// [`compute_promotions`]. A `pub struct Foo { v: u32 }` keeps its `v`
+/// field private after the split, but if a sibling sub-bucket reads
+/// `foo.v` we get E0616 even though the type is reachable. Lift inherited
+/// field visibility on every struct/union that lands in a sub-bucket — the
+/// scope is `pub(super)`, so external API doesn't widen.
+pub fn compute_field_lifts(
+    ctx: &RefContext<'_>,
+    items: &[ParsedItem],
+    promote: &BTreeSet<ItemId>,
+    stem: &str,
+) -> BTreeSet<ItemId> {
+    use crate::item::ItemKind;
+    items
+        .iter()
+        .filter_map(|it| {
+            let bucket = ctx.bucket_of.get(&it.id)?;
+            if is_facade_bucket(bucket, stem) {
+                return None;
+            }
+            // Items in `promote` get field-lifting via `add_pub_super`
+            // already; avoid double-rewrites.
+            if promote.contains(&it.id) {
+                return None;
+            }
+            match it.kind {
+                ItemKind::Struct | ItemKind::Union => Some(it.id),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// Field-lift only — same byte-splice mechanics as [`add_pub_super`] but
+/// without the leading-keyword splice. Used for structs/unions that
+/// aren't in the promote set (their *type* visibility is already enough,
+/// but their fields need to widen).
+pub fn add_pub_super_to_fields(source: &str) -> String {
+    let Ok(file) = syn::parse_file(source) else {
+        return source.to_string();
+    };
+    let Some(item) = file.items.first() else {
+        return source.to_string();
+    };
+    let mut points: Vec<usize> = Vec::new();
+    collect_field_insertion_points(item, source, &mut points);
+    if points.is_empty() {
+        return source.to_string();
+    }
+    points.sort_unstable();
+    points.dedup();
+    let mut out = source.to_string();
+    for &p in points.iter().rev() {
+        if p > out.len() {
+            return source.to_string();
+        }
+        out.insert_str(p, "pub(super) ");
+    }
+    out
+}
+
+/// Walk every code path in `source` and add another `super::` in front of
+/// any path whose first segment is `super`. This handles the body-code
+/// counterpart of the use-prelude rebase: the original file's
+/// `super::foo()` (calling a sibling at the file's parent level) needs
+/// to become `super::super::foo()` from inside a sub-file because the
+/// sub-file is one module-level deeper.
+///
+/// Skipped:
+///   * paths inside `Visibility::Restricted` (the `super` in `pub(super)` /
+///     `pub(in super::super)` is *visibility scope*, not a code reference,
+///     and is already handled by [`rebase_pub_super_in_subfile`]),
+///   * paths inside `use` items (those are handled by
+///     [`crate::write::uses::rebase_use_for_subfile`]).
+///
+/// We splice in reverse byte order so earlier offsets don't shift as we
+/// extend.
+pub fn rebase_body_super_for_subfile(source: &str) -> String {
+    let Ok(file) = syn::parse_file(source) else {
+        return source.to_string();
+    };
+    let mut v = BodyPathRebaser::default();
+    syn::visit::visit_file(&mut v, &file);
+    if v.points.is_empty() {
+        return source.to_string();
+    }
+    let mut offsets: Vec<usize> = v
+        .points
+        .iter()
+        .filter_map(|(l, c)| line_col_to_byte_offset(source, *l, *c))
+        .collect();
+    offsets.sort_unstable();
+    offsets.dedup();
+    let mut out = source.to_string();
+    for &p in offsets.iter().rev() {
+        if p > out.len() {
+            return source.to_string();
+        }
+        out.insert_str(p, "super::");
+    }
+    out
+}
+
+#[derive(Default)]
+struct BodyPathRebaser {
+    points: Vec<(usize, usize)>,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for BodyPathRebaser {
+    /// Don't descend into visibility annotations — their inner paths
+    /// (`pub(in super::super)` etc.) are scope qualifiers, not code refs.
+    fn visit_visibility(&mut self, _: &'ast syn::Visibility) {}
+
+    fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+        // A `use super::X;` inside a function body sits at fn scope, not
+        // module scope, but its path resolves the same way as a
+        // module-level use. From a sub-file the original `super` now
+        // points at the facade, so we need to prepend another `super::`
+        // for the path to reach what the user wrote (the facade's
+        // parent). The use-prelude rebase only handles MODULE-level uses
+        // because it operates on the prelude string; body-level uses
+        // need this hook.
+        record_leading_super(&item.tree, &mut self.points);
+    }
+
+    fn visit_path(&mut self, p: &'ast syn::Path) {
+        if let Some(first) = p.segments.first()
+            && first.ident == "super"
+        {
+            let start = first.ident.span().start();
+            self.points.push((start.line, start.column));
+        }
+        // Continue descent so generics / sub-paths inside this one are
+        // also processed (e.g. `Foo<super::Bar>`).
+        syn::visit::visit_path(self, p);
+    }
+}
+
+/// Walk a `UseTree` looking for a leading `super` segment. Records the
+/// position of that `super` so the surrounding splice loop can insert
+/// another `super::` in front of it. Groups recurse — `use { super::a,
+/// super::b };` is rare but legal.
+fn record_leading_super(tree: &syn::UseTree, points: &mut Vec<(usize, usize)>) {
+    use syn::UseTree;
+    match tree {
+        UseTree::Path(p) if p.ident == "super" => {
+            let start = p.ident.span().start();
+            points.push((start.line, start.column));
+        }
+        UseTree::Group(g) => {
+            for inner in &g.items {
+                record_leading_super(inner, points);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Sub-bucket items whose original visibility was `pub(super)` need a
@@ -313,8 +553,8 @@ pub fn compute_facade_imports(
     items: &[ParsedItem],
     promote: &BTreeSet<ItemId>,
     stem: &str,
-) -> BTreeSet<(String, String)> {
-    let mut out: BTreeSet<(String, String)> = BTreeSet::new();
+) -> BTreeSet<CrossImport> {
+    let mut out: BTreeSet<CrossImport> = BTreeSet::new();
     for it in items {
         let Some(my_bucket) = ctx.bucket_of.get(&it.id) else {
             continue;
@@ -336,7 +576,11 @@ pub fn compute_facade_imports(
                 continue;
             }
             let target = ctx.by_id[target_id];
-            out.insert(((*target_bucket).clone(), target.name.clone()));
+            out.insert(CrossImport {
+                source_bucket: (*target_bucket).clone(),
+                name: target.name.clone(),
+                cfg_attrs: cfg_attrs_of(&target.source),
+            });
         }
     }
     out
@@ -617,6 +861,89 @@ mod tests {
     }
 
     #[test]
+    fn cross_import_carries_cfg_attrs() {
+        // A cfg-only target (only one variant, no sibling): the use line
+        // MUST be cfg-gated, otherwise on non-matching platforms the use
+        // tries to resolve a symbol that doesn't exist (E0432).
+        let mut linux_only = fake(
+            0,
+            "linux_thing",
+            ItemVis::Private,
+            ItemKind::Fn { is_test: false },
+            &[],
+        );
+        linux_only.source = "#[cfg(target_os = \"linux\")]\nfn linux_thing() {}".to_string();
+        let consumer = fake(
+            1,
+            "uses_it",
+            ItemVis::Public,
+            ItemKind::Fn { is_test: false },
+            &["linux_thing"],
+        );
+        let items = vec![linux_only, consumer];
+        let mut plan = Plan::default();
+        plan.assign("misc", 0, "");
+        plan.assign("caller", 1, "");
+
+        let ctx = RefContext::new(&plan, &items);
+        let promote = compute_promotions(&ctx, &items, "file");
+        let cross = compute_cross_imports(&ctx, &items, &promote, "file");
+        let caller = cross.get("caller").expect("caller needs imports");
+        let import = caller
+            .iter()
+            .find(|c| c.name == "linux_thing")
+            .expect("linux_thing import present");
+        assert!(
+            import
+                .cfg_attrs
+                .iter()
+                .any(|s| s.contains("target_os") && s.contains("linux")),
+            "use line must carry the cfg(target_os = \"linux\") attr; got {:?}",
+            import.cfg_attrs
+        );
+    }
+
+    #[test]
+    fn promotion_expands_to_cfg_variant_siblings() {
+        // Two ParsedItems with the same name (cfg variants). Without the
+        // sibling expansion, only the last one wins in `name_to_id` and
+        // the other stays private — rustc picks the cfg-active variant
+        // at build time and randomly hits a private one.
+        let items = vec![
+            fake(
+                0,
+                "unix_id",
+                ItemVis::Private,
+                ItemKind::Fn { is_test: false },
+                &[],
+            ),
+            fake(
+                1,
+                "unix_id",
+                ItemVis::Private,
+                ItemKind::Fn { is_test: false },
+                &[],
+            ),
+            fake(
+                2,
+                "consumer",
+                ItemVis::Public,
+                ItemKind::Fn { is_test: false },
+                &["unix_id"],
+            ),
+        ];
+        let mut plan = Plan::default();
+        plan.assign("unix", 0, "");
+        plan.assign("unix", 1, "");
+        plan.assign("prim", 2, "");
+
+        let ctx = RefContext::new(&plan, &items);
+        let promote = compute_promotions(&ctx, &items, "file");
+        assert!(promote.contains(&0), "cfg variant 0 must be promoted");
+        assert!(promote.contains(&1), "cfg variant 1 must be promoted");
+    }
+
+    #[test]
     fn cross_bucket_private_ref_triggers_promotion_and_import() {
         // File stem is `sample`. `parser` (sub-bucket) calls `helper`
         // (private fn in `eval` sub-bucket). Expect: helper is in the
@@ -648,8 +975,10 @@ mod tests {
         let cross = compute_cross_imports(&ctx, &items, &promote, "sample");
         let parser_imports = cross.get("parser").expect("parser needs imports");
         assert!(
-            parser_imports.contains(&("eval".to_string(), "helper".to_string())),
-            "parser should import super::eval::helper"
+            parser_imports.iter().any(|c| c.source_bucket == "eval"
+                && c.name == "helper"
+                && c.cfg_attrs.is_empty()),
+            "parser should import super::eval::helper with no cfg attrs"
         );
     }
 
@@ -717,7 +1046,9 @@ mod tests {
 
         let facade_imports = compute_facade_imports(&ctx, &items, &promote, "sample");
         assert!(
-            facade_imports.contains(&("eval".to_string(), "helper".to_string())),
+            facade_imports
+                .iter()
+                .any(|c| c.source_bucket == "eval" && c.name == "helper"),
             "facade should import eval::helper"
         );
 
@@ -872,6 +1203,94 @@ mod tests {
             "pub(super) union U { pub(super) a: u32, pub(super) b: f32 }"
         );
         syn::parse_file(&out).expect("union must parse");
+    }
+
+    #[test]
+    fn rebase_body_super_call_expr() {
+        let src = "fn f() { super::foo(); }";
+        assert_eq!(
+            rebase_body_super_for_subfile(src),
+            "fn f() { super::super::foo(); }"
+        );
+    }
+
+    #[test]
+    fn rebase_body_super_path_in_type() {
+        let src = "fn f() -> super::T { super::make() }";
+        assert_eq!(
+            rebase_body_super_for_subfile(src),
+            "fn f() -> super::super::T { super::super::make() }"
+        );
+    }
+
+    #[test]
+    fn rebase_body_super_in_generic_arg() {
+        let src = "fn f() -> Vec<super::T> { Vec::new() }";
+        assert_eq!(
+            rebase_body_super_for_subfile(src),
+            "fn f() -> Vec<super::super::T> { Vec::new() }"
+        );
+    }
+
+    #[test]
+    fn rebase_body_super_in_body_level_use() {
+        // Real failure from the sonium2 sweep: `use super::X;` inside an
+        // inline test fn. The use's tree is `super::X` and from a sub-file
+        // that no longer resolves to the original parent — it resolves to
+        // the facade. The rebase has to find the leading `super` in the
+        // UseTree (not via visit_path) and insert another `super::`.
+        let src = "fn outer() { use super::time_stepping::Coeffs; let _ = Coeffs; }";
+        assert_eq!(
+            rebase_body_super_for_subfile(src),
+            "fn outer() { use super::super::time_stepping::Coeffs; let _ = Coeffs; }"
+        );
+    }
+
+    #[test]
+    fn rebase_body_super_skips_visibility() {
+        // The `super` inside `pub(super)` is a visibility scope, not a
+        // code reference. The body-rebaser must leave it alone — the vis
+        // is widened separately by `rebase_pub_super_in_subfile`.
+        let src = "pub(super) fn f() { super::foo(); }";
+        assert_eq!(
+            rebase_body_super_for_subfile(src),
+            "pub(super) fn f() { super::super::foo(); }"
+        );
+    }
+
+    #[test]
+    fn rebase_body_super_use_items_in_same_chunk() {
+        // The body-rebaser now visits ItemUse nodes too (to catch
+        // body-level uses). When given a file with a module-level use
+        // alongside a fn, both get rebased — which is fine because the
+        // pipeline never feeds top-level uses *and* fn items as one
+        // chunk: in render_sub_file the bucket emits each non-use item
+        // separately, and the use prelude is generated upstream. This
+        // test pins the function's behavior on a synthetic combined
+        // input so future refactors of the visitor don't silently break
+        // the body-level case.
+        let src = "use super::X;\nfn f() { super::y(); }";
+        assert_eq!(
+            rebase_body_super_for_subfile(src),
+            "use super::super::X;\nfn f() { super::super::y(); }"
+        );
+    }
+
+    #[test]
+    fn rebase_body_super_no_op_when_no_super() {
+        let src = "fn f() { let x = crate::foo::bar(); }";
+        assert_eq!(rebase_body_super_for_subfile(src), src);
+    }
+
+    #[test]
+    fn rebase_body_super_multiple_paths_same_line() {
+        // Reverse-order splice safety: two `super::` on the same line
+        // must both get rewritten without corrupting offsets.
+        let src = "fn f() { super::a(); super::b(); }";
+        assert_eq!(
+            rebase_body_super_for_subfile(src),
+            "fn f() { super::super::a(); super::super::b(); }"
+        );
     }
 
     #[test]
