@@ -3,11 +3,13 @@
 //! aware IDE, …) can discover and invoke r2factor's split pipeline as
 //! first-class tools.
 //!
-//! Two tools are exposed:
+//! The core tools are:
 //!   * `split_dry_run` — analyze a file, return the proposed plan and
 //!     cohesion report as JSON.
 //!   * `split_write` — actually materialize the split (destructive: takes
 //!     a `force` flag).
+//!   * `consolidate_*` — merge a facade + sub-files into inline modules.
+//!   * `flatten_*` — dissolve those inline modules into one scope.
 //!
 //! The protocol stream lives on stdout; logs and diagnostics go to stderr,
 //! which most MCP clients display in a separate channel.
@@ -122,6 +124,8 @@ fn handle_tools_list() -> serde_json::Value {
             split_write_descriptor(),
             consolidate_dry_run_descriptor(),
             consolidate_write_descriptor(),
+            flatten_dry_run_descriptor(),
+            flatten_write_descriptor(),
         ],
     })
 }
@@ -181,6 +185,8 @@ fn handle_tools_call(params: serde_json::Value) -> Result<serde_json::Value, Str
         "split_write" => tool_split_write(&arguments),
         "consolidate_dry_run" => tool_consolidate_dry_run(&arguments),
         "consolidate_write" => tool_consolidate_write(&arguments),
+        "flatten_dry_run" => tool_flatten_dry_run(&arguments),
+        "flatten_write" => tool_flatten_write(&arguments),
         _ => return Err(format!("unknown tool: {name}")),
     };
     // MCP convention: a *tool* error is data (isError: true in the result),
@@ -229,6 +235,37 @@ fn consolidate_write_descriptor() -> serde_json::Value {
     })
 }
 
+fn flatten_dry_run_descriptor() -> serde_json::Value {
+    serde_json::json!({
+        "name": "flatten_dry_run",
+        "description": "Post-pass for `consolidate`: given a single .rs file with top-level inline `mod bucket { ... }` blocks, return flattened source that drops the wrappers and renames named items to `bucket_name`. Non-destructive — no files are touched.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "file": {
+                    "type": "string",
+                    "description": "Path to the consolidated .rs file containing inline modules.",
+                },
+            },
+            "required": ["file"],
+        },
+    })
+}
+
+fn flatten_write_descriptor() -> serde_json::Value {
+    serde_json::json!({
+        "name": "flatten_write",
+        "description": "DESTRUCTIVE: flatten a consolidated .rs file in place. Backs up the original to <file>.bak, drops top-level inline module wrappers, and renames named items to `bucket_name`. This single-file mode does not rewrite other files.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "file": { "type": "string" },
+            },
+            "required": ["file"],
+        },
+    })
+}
+
 fn tool_consolidate_dry_run(args: &serde_json::Value) -> Result<String, String> {
     let path = require_string(args, "path")?;
     let merged = crate::consolidate::consolidate_dry_run(Path::new(path))
@@ -241,6 +278,19 @@ fn tool_consolidate_write(args: &serde_json::Value) -> Result<String, String> {
     let opts = crate::consolidate::ConsolidateOptions { write: true };
     let report = crate::consolidate::consolidate_write(Path::new(path), &opts)
         .map_err(|e| format!("consolidate {path}: {e}"))?;
+    serde_json::to_string_pretty(&report).map_err(|e| e.to_string())
+}
+
+fn tool_flatten_dry_run(args: &serde_json::Value) -> Result<String, String> {
+    let file = require_string(args, "file")?;
+    crate::flatten::flatten_dry_run(Path::new(file)).map_err(|e| format!("flatten {file}: {e}"))
+}
+
+fn tool_flatten_write(args: &serde_json::Value) -> Result<String, String> {
+    let file = require_string(args, "file")?;
+    let opts = crate::flatten::FlattenOptions { write: true };
+    let report = crate::flatten::flatten_write(Path::new(file), &opts)
+        .map_err(|e| format!("flatten {file}: {e}"))?;
     serde_json::to_string_pretty(&report).map_err(|e| e.to_string())
 }
 
@@ -264,8 +314,7 @@ fn tool_split_dry_run(args: &serde_json::Value) -> Result<String, String> {
             "{file} is already an r2factor facade — won't analyze it"
         ));
     }
-    let mut items =
-        crate::item::parse_file(&src).map_err(|e| format!("parse {file}: {e}"))?;
+    let mut items = crate::item::parse_file(&src).map_err(|e| format!("parse {file}: {e}"))?;
     let evidence = if use_tokensave {
         load_tokensave_evidence(path, &items)
     } else {
@@ -284,10 +333,7 @@ fn tool_split_dry_run(args: &serde_json::Value) -> Result<String, String> {
 
 fn tool_split_write(args: &serde_json::Value) -> Result<String, String> {
     let file = require_string(args, "file")?;
-    let force = args
-        .get("force")
-        .and_then(|b| b.as_bool())
-        .unwrap_or(false);
+    let force = args.get("force").and_then(|b| b.as_bool()).unwrap_or(false);
     let use_tokensave = args
         .get("use_tokensave")
         .and_then(|b| b.as_bool())
@@ -300,8 +346,7 @@ fn tool_split_write(args: &serde_json::Value) -> Result<String, String> {
             "{file} is already an r2factor facade — refusing to re-split"
         ));
     }
-    let mut items =
-        crate::item::parse_file(&src).map_err(|e| format!("parse {file}: {e}"))?;
+    let mut items = crate::item::parse_file(&src).map_err(|e| format!("parse {file}: {e}"))?;
     let evidence = if use_tokensave {
         load_tokensave_evidence(path, &items)
     } else {

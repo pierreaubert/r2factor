@@ -76,7 +76,7 @@ fn initialize_returns_protocol_info() {
 }
 
 #[test]
-fn tools_list_advertises_both_tools() {
+fn tools_list_advertises_available_tools() {
     let mut sess = McpSession::start();
     let resp = sess.request(serde_json::json!({
         "jsonrpc": "2.0",
@@ -87,12 +87,13 @@ fn tools_list_advertises_both_tools() {
     let tools = resp["result"]["tools"]
         .as_array()
         .expect("tools is an array");
-    let names: Vec<&str> = tools
-        .iter()
-        .filter_map(|t| t["name"].as_str())
-        .collect();
+    let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert!(names.contains(&"split_dry_run"));
     assert!(names.contains(&"split_write"));
+    assert!(names.contains(&"consolidate_dry_run"));
+    assert!(names.contains(&"consolidate_write"));
+    assert!(names.contains(&"flatten_dry_run"));
+    assert!(names.contains(&"flatten_write"));
     // Each tool MUST carry an inputSchema or MCP clients can't render it.
     for t in tools {
         assert!(

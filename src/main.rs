@@ -30,6 +30,17 @@ enum Cmd {
         #[arg(long)]
         write: bool,
     },
+    /// Flatten a consolidated file's inline modules into one scope with
+    /// mechanical bucket-prefixed renames. Without --write, prints the
+    /// flattened content to stdout.
+    Flatten {
+        /// The consolidated `.rs` file containing inline `mod name { ... }`
+        /// blocks.
+        file: PathBuf,
+        /// Actually replace the file in place, backing it up to `.bak`.
+        #[arg(long)]
+        write: bool,
+    },
     /// Propose how to split a single .rs file into a module of smaller files.
     Split {
         file: PathBuf,
@@ -81,6 +92,27 @@ fn main() -> Result<()> {
             } else {
                 let merged = r2factor::consolidate::consolidate_dry_run(&path)?;
                 println!("{merged}");
+                Ok(())
+            }
+        }
+        Cmd::Flatten { file, write } => {
+            if write {
+                let report = r2factor::flatten::flatten_write(
+                    &file,
+                    &r2factor::flatten::FlattenOptions { write: true },
+                )?;
+                eprintln!("[flatten] flattened -> {}", report.target.display());
+                if let Some(b) = &report.backup {
+                    eprintln!("[flatten] backup -> {}", b.display());
+                }
+                eprintln!("[flatten] rewrites -> {}", report.rewrites);
+                for warning in &report.warnings {
+                    eprintln!("[flatten] warning: {warning}");
+                }
+                Ok(())
+            } else {
+                let flattened = r2factor::flatten::flatten_dry_run(&file)?;
+                println!("{flattened}");
                 Ok(())
             }
         }

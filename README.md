@@ -79,7 +79,8 @@ the `tokensave` path-deps.
 
 ## CLI usage
 
-Two subcommands: `split` (the original) and `consolidate` (the inverse).
+Three subcommands: `split` (the original), `consolidate` (the inverse),
+and `flatten` (an optional post-pass after consolidation).
 
 ### `split`
 
@@ -154,6 +155,30 @@ r2factor consolidate path/to/foo.rs --write
 For `foo/mod.rs` input, the merged content lands at `<parent>/foo.rs`
 and the `foo/` directory is deleted entirely.
 
+### `flatten`
+
+```
+r2factor flatten <file> [--write]
+```
+
+Optional post-pass for a consolidated file. It takes a single `.rs` file
+containing top-level inline modules, drops those module wrappers, and
+renames each named item inside them to `<module>_<item>` so sibling names
+do not collide.
+
+```bash
+# Dry-run: print flattened content to stdout
+r2factor flatten path/to/foo.rs
+
+# Replace in place, backing up the original to `foo.rs.bak`
+r2factor flatten path/to/foo.rs --write
+```
+
+This first flatten mode is intentionally single-file only. It rewrites
+declarations, intra-file paths, simple re-exports, and simple glob
+re-exports in the merged file itself. It does not rewrite consumers in the
+rest of the repo; a later cross-file mode can use tokensave for that.
+
 ---
 
 ## MCP server
@@ -165,12 +190,14 @@ MCP-aware tool can call it as a first-class action.
 ### What `r2factor mcp` is
 
 A JSON-RPC 2.0 stdio server. **You don't launch it manually** — your MCP
-client spawns it on demand. Four tools are exposed:
+client spawns it on demand. Six tools are exposed:
 
 - `split_dry_run` — analyze a file, return the proposed plan + cohesion.
 - `split_write` — actually perform the split (destructive; takes `force`).
 - `consolidate_dry_run` — inverse: return the merged source as text.
 - `consolidate_write` — inverse: replace the facade in place (destructive).
+- `flatten_dry_run` — flatten a consolidated file into one scope as text.
+- `flatten_write` — replace the consolidated file in place (destructive).
 
 Stdout carries the protocol stream. Logs go to stderr so they don't
 corrupt the JSON-RPC framing.
@@ -381,6 +408,38 @@ For `foo/mod.rs` input, `merged_target` is at the parent level
 (`<parent>/foo.rs`) and the old `foo/mod.rs` is included in
 `removed_files`.
 
+#### `flatten_dry_run`
+
+Non-destructive. Returns flattened Rust source as a text payload.
+
+**Input**
+
+| field | type | required | meaning |
+|---|---|---|---|
+| `file` | string | yes | Path to the consolidated `.rs` file containing inline modules. |
+
+#### `flatten_write`
+
+Destructive. Performs the flatten pass in place.
+
+**Input**
+
+| field | type | required | meaning |
+|---|---|---|---|
+| `file` | string | yes | Same as `flatten_dry_run`. |
+
+**Returns**
+
+```json
+{
+  "target": "path/to/foo.rs",
+  "backup": "path/to/foo.rs.bak",
+  "rewrites": 12,
+  "warnings": [],
+  "source_bytes": 4321
+}
+```
+
 ### Verifying the server
 
 You can drive it by hand to confirm everything's wired up:
@@ -426,10 +485,12 @@ src/
   tokensave.rs   — optional tokensave cross-symbol evidence
   pipeline.rs    — run_split orchestrator
   consolidate.rs — inverse pipeline (merge back into one file)
+  flatten.rs     — optional single-file flatten post-pass
 tests/
   split_e2e.rs       — splitter on fixtures + rustc compile-check
   mcp_e2e.rs         — drives the MCP server over real stdio
   consolidate_e2e.rs — round-trip + hand-written-module merge tests
+  flatten_e2e.rs     — single-file flatten post-pass tests
 fixtures/
   sample.rs      — small demo file used by tests and CLI examples
 ```
