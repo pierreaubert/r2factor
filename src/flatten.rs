@@ -98,6 +98,9 @@ fn flatten_source(src: &str) -> Result<(String, FlattenDetails)> {
 
     let inline_ranges = inline_content_ranges(src, &inline_mods)?;
     let mut warnings = Vec::new();
+    if let Some(warning) = private_visibility_widening_warning(&inline_mods) {
+        warnings.push(warning);
+    }
     let mut replacements = Vec::new();
     let import_aliases = build_import_alias_map(&file, &rename_map);
     collect_decl_replacements(src, &inline_mods, &rename_map, &mut replacements);
@@ -189,6 +192,38 @@ fn build_rename_map(mods: &[&syn::ItemMod]) -> RenameMap {
         }
     }
     map
+}
+
+fn private_visibility_widening_warning(mods: &[&syn::ItemMod]) -> Option<String> {
+    let mut widened = Vec::new();
+    for m in mods {
+        let Some((_, items)) = &m.content else {
+            continue;
+        };
+        for item in items {
+            if !is_private_named_item(item) {
+                continue;
+            }
+            let Some((name, _)) = named_item(item) else {
+                continue;
+            };
+            widened.push(format!("{}::{name}", m.ident));
+        }
+    }
+
+    if widened.is_empty() {
+        return None;
+    }
+
+    let suffix = if widened.len() == 1 {
+        String::new()
+    } else {
+        format!(" and {} more", widened.len() - 1)
+    };
+    Some(format!(
+        "flattening widens private inline-module items to parent-module visibility (e.g. {}{})",
+        widened[0], suffix
+    ))
 }
 
 fn collect_decl_replacements(
@@ -1228,6 +1263,22 @@ fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
         syn::Item::Use(i) => &i.attrs,
         syn::Item::Verbatim(_) => &[],
         _ => &[],
+    }
+}
+
+fn is_private_named_item(item: &syn::Item) -> bool {
+    match item {
+        syn::Item::Const(i) => matches!(i.vis, syn::Visibility::Inherited),
+        syn::Item::Enum(i) => matches!(i.vis, syn::Visibility::Inherited),
+        syn::Item::Fn(i) => matches!(i.vis, syn::Visibility::Inherited),
+        syn::Item::Macro(i) => i.ident.is_some(),
+        syn::Item::Static(i) => matches!(i.vis, syn::Visibility::Inherited),
+        syn::Item::Struct(i) => matches!(i.vis, syn::Visibility::Inherited),
+        syn::Item::Trait(i) => matches!(i.vis, syn::Visibility::Inherited),
+        syn::Item::TraitAlias(i) => matches!(i.vis, syn::Visibility::Inherited),
+        syn::Item::Type(i) => matches!(i.vis, syn::Visibility::Inherited),
+        syn::Item::Union(i) => matches!(i.vis, syn::Visibility::Inherited),
+        _ => false,
     }
 }
 

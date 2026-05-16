@@ -140,6 +140,7 @@ fn flatten_write_backs_up_and_reports() {
     assert_eq!(report.target, foo);
     assert!(report.backup.as_ref().unwrap().exists());
     assert!(report.rewrites > 0);
+    assert!(report.warnings.iter().any(|w| w.contains("widens private")));
 
     let flattened = fs::read_to_string(&foo).unwrap();
     assert!(flattened.contains("const bucket_N"));
