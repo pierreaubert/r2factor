@@ -120,6 +120,8 @@ fn handle_tools_list() -> serde_json::Value {
         "tools": [
             split_dry_run_descriptor(),
             split_write_descriptor(),
+            consolidate_dry_run_descriptor(),
+            consolidate_write_descriptor(),
         ],
     })
 }
@@ -177,6 +179,8 @@ fn handle_tools_call(params: serde_json::Value) -> Result<serde_json::Value, Str
     let outcome = match name {
         "split_dry_run" => tool_split_dry_run(&arguments),
         "split_write" => tool_split_write(&arguments),
+        "consolidate_dry_run" => tool_consolidate_dry_run(&arguments),
+        "consolidate_write" => tool_consolidate_write(&arguments),
         _ => return Err(format!("unknown tool: {name}")),
     };
     // MCP convention: a *tool* error is data (isError: true in the result),
@@ -192,6 +196,52 @@ fn handle_tools_call(params: serde_json::Value) -> Result<serde_json::Value, Str
         }),
     };
     Ok(content)
+}
+
+fn consolidate_dry_run_descriptor() -> serde_json::Value {
+    serde_json::json!({
+        "name": "consolidate_dry_run",
+        "description": "Inverse of `split_dry_run`. Given a facade file (`foo.rs` next to `foo/`, or `foo/mod.rs`) or a directory containing the sub-buckets, return the merged single-file source as text. Non-destructive — no files are touched.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to the facade file or the sub-directory.",
+                },
+            },
+            "required": ["path"],
+        },
+    })
+}
+
+fn consolidate_write_descriptor() -> serde_json::Value {
+    serde_json::json!({
+        "name": "consolidate_write",
+        "description": "DESTRUCTIVE: produce the merged single-file content AND write it to disk. Backs up the facade to <facade>.bak, writes the merged content to the resolved target path, and deletes the sub-directory. Run `consolidate_dry_run` first to preview.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+            },
+            "required": ["path"],
+        },
+    })
+}
+
+fn tool_consolidate_dry_run(args: &serde_json::Value) -> Result<String, String> {
+    let path = require_string(args, "path")?;
+    let merged = crate::consolidate::consolidate_dry_run(Path::new(path))
+        .map_err(|e| format!("consolidate {path}: {e}"))?;
+    Ok(merged)
+}
+
+fn tool_consolidate_write(args: &serde_json::Value) -> Result<String, String> {
+    let path = require_string(args, "path")?;
+    let opts = crate::consolidate::ConsolidateOptions { write: true };
+    let report = crate::consolidate::consolidate_write(Path::new(path), &opts)
+        .map_err(|e| format!("consolidate {path}: {e}"))?;
+    serde_json::to_string_pretty(&report).map_err(|e| e.to_string())
 }
 
 fn require_string<'a>(args: &'a serde_json::Value, key: &str) -> Result<&'a str, String> {

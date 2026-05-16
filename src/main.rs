@@ -18,6 +18,18 @@ enum Cmd {
     /// Lets an MCP-aware client (Claude Code, IDE extensions, etc.)
     /// discover and call `split_dry_run` and `split_write` as tools.
     Mcp,
+    /// Consolidate `foo.rs + foo/` (or `foo/mod.rs + foo/*.rs`) back into
+    /// a single `.rs` file. Inverse of `split`. Without --write, just
+    /// prints the merged content to stdout.
+    Consolidate {
+        /// Either the facade file (`foo.rs` or `foo/mod.rs`) or the
+        /// sub-directory containing the buckets.
+        path: PathBuf,
+        /// Actually replace the facade in place, backup to `.bak`, and
+        /// delete the sub-dir.
+        #[arg(long)]
+        write: bool,
+    },
     /// Propose how to split a single .rs file into a module of smaller files.
     Split {
         file: PathBuf,
@@ -51,6 +63,27 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Mcp => r2factor::mcp::serve(),
+        Cmd::Consolidate { path, write } => {
+            if write {
+                let report = r2factor::consolidate::consolidate_write(
+                    &path,
+                    &r2factor::consolidate::ConsolidateOptions { write: true },
+                )?;
+                eprintln!("[consolidate] merged -> {}", report.merged_target.display());
+                if let Some(b) = &report.backup {
+                    eprintln!("[consolidate] backup -> {}", b.display());
+                }
+                eprintln!(
+                    "[consolidate] removed {} sub-file(s)",
+                    report.removed_files.len()
+                );
+                Ok(())
+            } else {
+                let merged = r2factor::consolidate::consolidate_dry_run(&path)?;
+                println!("{merged}");
+                Ok(())
+            }
+        }
         Cmd::Split {
             file,
             no_tokensave,
