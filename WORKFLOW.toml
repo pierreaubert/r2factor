@@ -16,9 +16,38 @@ interval_ms = 5000
 
 [agent]
 kind = "codex"
-command = "codex app-server"
+# Local Qwen3.6-27B-NVFP4 served by vLLM on the GPU box (switched from
+# llama.cpp + the 35B-A3B MoE because that crashed; this dense 27B in
+# NVFP4 is slower but stable). The `-c` overrides bypass whatever default
+# model_provider lives in ~/.codex/config.toml.
+#
+# The model name MUST match what vLLM advertises:
+#   curl http://192.168.1.36:8000/v1/models | jq -r '.data[].id'
+# vLLM defaults to serving under the HuggingFace repo path; override with
+# `--served-model-name` on the vLLM CLI to change it. Update this string
+# if the served id differs from the guess below.
+command = "codex app-server -c model_provider=vllm -c model='unsloth/Qwen3.6-27B-NVFP4'"
+# vLLM batches requests internally and can sustain higher concurrency
+# than llama.cpp's slot model, but the GPU is shared with other repos
+# via the global cap in workspaces.toml. Keep per-repo at 2.
 max_concurrent_agents = 2
+# Dense Qwen3-27B is more reliable on tool-call JSON than the A3B MoE
+# (no expert-routing slips), so we can afford the same turn budget as
+# cloud codex.
 max_turns = 40
+max_retry_backoff_ms = 60000
+
+# Point codex at the local OpenAI-compatible endpoint. vLLM defaults to
+# port 8000; if you launched it on a different port, update here. The
+# API key is a no-op for vLLM (unless --api-key was set on launch) but
+# must be non-empty for codex's auth layer.
+[[agent.env]]
+key = "OPENAI_BASE_URL"
+value = "http://192.168.1.36:8000/v1"
+
+[[agent.env]]
+key = "OPENAI_API_KEY"
+value = "sk-vllm-ignored"
 
 [hooks]
 after_create = "git clone http://192.168.1.32:3001/pierre/r2factor.git ."

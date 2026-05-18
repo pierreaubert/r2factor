@@ -3359,7 +3359,7 @@ dependencies = [
  "syn",
  "tempfile",
  "tokensave",
- "tokensave-large-treesitters 0.4.0",
+ "tokensave-large-treesitters 0.5.0",
  "tokio",
  "ureq 2.12.1",
 ]
@@ -4070,7 +4070,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokensave"
-version = "4.14.3"
+version = "5.1.1"
 dependencies = [
  "bincode",
  "clap",
@@ -4097,7 +4097,7 @@ dependencies = [
  "sha2",
  "tar",
  "thiserror 2.0.18",
- "tokensave-large-treesitters 0.5.0",
+ "tokensave-large-treesitters 0.5.0 (git+https://github.com/aovestdipaperino/tokensave-large-treesitters)",
  "tokio",
  "tokio-util",
  "toml",
@@ -4113,7 +4113,7 @@ dependencies = [
 
 [[package]]
 name = "tokensave-large-treesitters"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arborium-kotlin",
  "arborium-lean",

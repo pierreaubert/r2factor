@@ -1,0 +1,110 @@
++++
+[tracker]
+kind = "gitea"
+base_url = "http://192.168.1.32:3001"
+repo = "pierre/r2factor"
+token = "$GITEA_TOKEN"
+required_label = "agent-ready"
+close_on_success = false
+success_comment = "Agent run finished — PR opened, ready for human review."
+
+[workspace]
+root = "/Volumes/home_tmp/tmp/menuet-workspaces/r2factor"
+
+[polling]
+interval_ms = 5000
+
+# ─────────────────────────────────────────────────────────────────
+# kimi CLI variant. Uses the `kimi` binary in non-interactive print
+# mode. The model and provider live in kimi's own config file
+# (~/.kimi/config or similar — check `kimi config --help`); we just
+# hand it a prompt and let it run.
+#
+# Override the model on a per-workflow basis by adding `-m <name>`
+# to args, e.g. ["--print", "-m", "kimi-k2-thinking-2509", "-p"].
+# Run `kimi models` or check the Moonshot console for current ids.
+# ─────────────────────────────────────────────────────────────────
+[agent]
+kind = "kimi"
+program = "kimi"
+# `--print` runs non-interactively, streams output to stdout (which
+# menuet captures line-by-line as Progress events).
+# `-p` is followed by the prompt; menuet appends it via prompt_via=arg.
+# `--afk` skips any human-input prompts so menuet can dispatch headless.
+args    = ["--afk", "--print", "-p"]
+prompt_via = "arg"
+max_concurrent_agents = 2
+max_turns = 30
+max_retry_backoff_ms = 60000
+# kimi reads MOONSHOT_API_KEY from the env by default; if you keep
+# the key in a different var, surface it here. `$NAME` is expanded
+# from menuet's own environment at startup.
+[[agent.env]]
+key   = "MOONSHOT_API_KEY"
+value = "$MOONSHOT_API_KEY"
+
+[hooks]
+after_create = "git clone http://192.168.1.32:3001/pierre/r2factor.git ."
+timeout_ms = 600000
+
+[server]
+port = 8766
++++
+
+You are an autonomous coding agent assigned to {{ issue.identifier }} in the
+`pierre/r2factor` Gitea repository.
+
+Title: {{ issue.title }}
+URL:   {{ issue.url }}
+
+Issue body:
+{{ issue.description }}
+
+Working agreement:
+
+1. Read `README.md` (and any `AGENTS.md` / `CLAUDE.md` if present) before
+   touching code.
+2. Note the local path-deps in `Cargo.toml` (`tokensave`,
+   `tokensave-large-treesitters`). They live at
+   `/Users/pierre/src/tokensave/...` on the host but will not exist inside
+   the fresh workspace clone. If your change does not need them, prefer
+   running with `--no-tokensave` or temporarily patching the manifest in
+   your branch; do NOT commit a permanent removal of those deps unless the
+   issue asks for it.
+3. Work on a feature branch named `agent/{{ issue.identifier | downcase }}`.
+4. Keep changes scoped to the issue. No drive-by refactors.
+5. Verify before declaring done:
+   - `cargo check` and `cargo clippy` clean of warnings.
+   - `cargo test` for the affected paths.
+6. When work is complete, push the branch and open a pull request against
+   `main` on the Gitea forge. Use `curl` against the Gitea REST API
+   directly (kimi does NOT get menuet's `forge_api` tool — that's
+   codex-only). Auth via `$GITEA_TOKEN`, which menuet exports into your
+   subprocess environment:
+       curl -X POST -H "Authorization: token $GITEA_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"title":"...","head":"agent/...","base":"main","body":"..."}' \
+            http://192.168.1.32:3001/api/v1/repos/pierre/r2factor/pulls
+   Link the PR back to this issue and comment a short summary.
+7. If you hit a blocker that needs human input, leave a comment on the
+   issue describing exactly what you tried and what decision is required,
+   then stop.
+
+Status updates — same cadence as the codex/opencode variants. Every write
+goes through `curl` to the Gitea REST API. Parse the numeric issue number
+from `{{ issue.identifier }}` (part after `#`) once at the start and
+reuse. Comment path:
+    POST http://192.168.1.32:3001/api/v1/repos/pierre/r2factor/issues/<N>/comments
+    Authorization: token $GITEA_TOKEN
+    Content-Type: application/json
+    body: {"body": "..."}
+
+Cadence (milestone-only):
+A. On decomposition. Create sub-tasks via POST /repos/.../issues; comment
+   the new numbers on the parent.
+B. On each push to the forge. One comment per push batch, listing the
+   commits pushed.
+C. On each green verification batch. ONE comment with the exact commands
+   and a one-line result.
+D. On blockers (step 7).
+E. Final PR link (step 6).
