@@ -61,11 +61,7 @@ fn assert_parses(path: &Path) {
 /// branch.
 fn compile_check(tmp_root: &Path, stem: &str) {
     let lib_path = tmp_root.join("lib.rs");
-    fs::write(
-        &lib_path,
-        format!("#![allow(warnings)]\npub mod {stem};\n"),
-    )
-    .expect("write lib.rs");
+    fs::write(&lib_path, format!("#![allow(warnings)]\npub mod {stem};\n")).expect("write lib.rs");
 
     let out_dir = tmp_root.join("rustc-out");
     fs::create_dir_all(&out_dir).expect("mkdir rustc-out");
@@ -88,6 +84,32 @@ fn compile_check(tmp_root: &Path, stem: &str) {
             .unwrap_or_else(|_| "<facade unreadable>".into());
         panic!(
             "split output for stem `{stem}` failed to compile.\n\n--- rustc stderr ---\n{stderr}\n--- rustc stdout ---\n{stdout}\n--- facade ---\n{facade}"
+        );
+    }
+}
+
+fn compile_existing_lib(tmp_root: &Path) {
+    let lib_path = tmp_root.join("lib.rs");
+    let out_dir = tmp_root.join("rustc-out");
+    fs::create_dir_all(&out_dir).expect("mkdir rustc-out");
+
+    let output = Command::new("rustc")
+        .arg("--edition=2024")
+        .arg("--crate-type=lib")
+        .arg("--emit=metadata")
+        .arg("-Awarnings")
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .arg(&lib_path)
+        .output()
+        .expect("invoke rustc");
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let lib = fs::read_to_string(&lib_path).unwrap_or_else(|_| "<lib.rs unreadable>".into());
+        panic!(
+            "split lib.rs failed to compile.\n\n--- rustc stderr ---\n{stderr}\n--- rustc stdout ---\n{stdout}\n--- lib.rs ---\n{lib}"
         );
     }
 }
@@ -265,6 +287,213 @@ fn make() -> Tagged { Tagged(7) }
 }
 
 #[test]
+fn splits_lib_rs_with_path_attributed_child_modules() {
+    let src = r#"#![allow(dead_code)]
+
+macro_rules! answer {
+    () => { 42 };
+}
+
+pub struct Foo;
+pub struct Bar;
+pub struct Baz;
+
+pub fn value() -> u32 {
+    answer!()
+}
+
+#[cfg(test)]
+fn test_only() {
+    assert_eq!(value(), 42);
+}
+"#;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let file = tmp.path().join("lib.rs");
+    fs::write(&file, src).expect("write lib.rs");
+
+    run_split(
+        &file,
+        SplitOptions {
+            use_tokensave: false,
+            llm: None,
+            write: Some(WriteOptions { force: false }),
+        },
+    )
+    .expect("split lib.rs");
+
+    let lib_dir = tmp.path().join("lib");
+    assert!(
+        lib_dir.join("types.rs").exists(),
+        "types.rs should be generated under lib/"
+    );
+    assert!(
+        lib_dir.join("macros.rs").exists(),
+        "macros.rs should be generated under lib/"
+    );
+    assert!(
+        lib_dir.join("tests.rs").exists(),
+        "tests.rs should be generated under lib/"
+    );
+
+    let facade_src = fs::read_to_string(&file).expect("read generated lib.rs");
+    assert!(
+        facade_src.contains("#[path = \"lib/types.rs\"]\nmod types;"),
+        "lib.rs facade should path-attribute normal modules; got:\n{facade_src}"
+    );
+    assert!(
+        facade_src.contains("#[macro_use]\n#[path = \"lib/macros.rs\"]\nmod macros;"),
+        "lib.rs facade should stack macro_use before the path attribute; got:\n{facade_src}"
+    );
+    assert!(
+        facade_src.contains("#[cfg(test)]\n#[path = \"lib/tests.rs\"]\nmod tests;"),
+        "lib.rs facade should stack cfg(test) before the path attribute; got:\n{facade_src}"
+    );
+
+    assert_parses(&file);
+    for entry in fs::read_dir(&lib_dir).expect("lib dir exists") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+            assert_parses(&path);
+        }
+    }
+    compile_existing_lib(tmp.path());
+}
+
+#[test]
+fn splits_mod_rs_in_place_without_declaring_mod_mod() {
+    let src = r#"pub struct Foo;
+pub struct Bar;
+pub struct Baz;
+
+pub fn module_value() -> u32 {
+    sibling::helper()
+}
+"#;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let module_dir = tmp.path().join("foo");
+    fs::create_dir_all(&module_dir).expect("mkdir foo");
+    let file = module_dir.join("mod.rs");
+    fs::write(&file, src).expect("write mod.rs");
+    fs::write(
+        module_dir.join("sibling.rs"),
+        "pub fn helper() -> u32 { 9 }\n",
+    )
+    .expect("write sibling.rs");
+
+    run_split(
+        &file,
+        SplitOptions {
+            use_tokensave: false,
+            llm: None,
+            write: Some(WriteOptions { force: false }),
+        },
+    )
+    .expect("split mod.rs");
+
+    assert!(
+        module_dir.join("types.rs").exists(),
+        "types.rs should be generated beside mod.rs"
+    );
+    let facade_src = fs::read_to_string(&file).expect("read generated mod.rs");
+    assert!(
+        !facade_src.contains("mod mod;"),
+        "mod.rs facade must not declare itself as a child module; got:\n{facade_src}"
+    );
+    assert!(
+        facade_src.contains("mod sibling;"),
+        "existing sibling modules should be preserved in the facade; got:\n{facade_src}"
+    );
+    assert!(
+        facade_src.contains("mod types;"),
+        "generated sibling modules should use normal mod declarations; got:\n{facade_src}"
+    );
+
+    assert_parses(&file);
+    assert_parses(&module_dir.join("types.rs"));
+    compile_check(tmp.path(), "foo");
+}
+
+#[test]
+fn split_lib_rs_preserves_existing_lib_submodules() {
+    let src = r#"pub struct Foo;
+pub struct Bar;
+pub struct Baz;
+"#;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let file = tmp.path().join("lib.rs");
+    fs::write(&file, src).expect("write lib.rs");
+    let lib_dir = tmp.path().join("lib");
+    fs::create_dir_all(&lib_dir).expect("mkdir lib");
+    fs::write(lib_dir.join("existing.rs"), "pub fn helper() -> u32 { 42 }\n")
+        .expect("write existing.rs");
+
+    run_split(
+        &file,
+        SplitOptions {
+            use_tokensave: false,
+            llm: None,
+            write: Some(WriteOptions { force: false }),
+        },
+    )
+    .expect("split lib.rs");
+
+    let existing_src = fs::read_to_string(lib_dir.join("existing.rs")).expect("read existing.rs");
+    assert_eq!(
+        existing_src, "pub fn helper() -> u32 { 42 }\n",
+        "existing lib/existing.rs should be preserved"
+    );
+    let facade_src = fs::read_to_string(&file).expect("read generated lib.rs");
+    assert!(
+        facade_src.contains("#[path = \"lib/existing.rs\"]\nmod existing;"),
+        "existing lib/ modules should be path-attributed in the facade; got:\n{facade_src}"
+    );
+    assert!(
+        facade_src.contains("pub use existing::*;"),
+        "existing lib/ modules should still be re-exported; got:\n{facade_src}"
+    );
+    compile_existing_lib(tmp.path());
+}
+
+#[test]
+fn split_mod_rs_force_stale_cleanup_keeps_facade() {
+    let src = r#"pub struct Foo;
+pub struct Bar;
+pub struct Baz;
+"#;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let module_dir = tmp.path().join("foo");
+    fs::create_dir_all(&module_dir).expect("mkdir foo");
+    let file = module_dir.join("mod.rs");
+    fs::write(&file, src).expect("write mod.rs");
+    fs::write(
+        module_dir.join("old.rs"),
+        "// Auto-generated by r2factor. Manual edits will be overwritten on next split.\n",
+    )
+    .expect("write stale old.rs");
+
+    run_split(
+        &file,
+        SplitOptions {
+            use_tokensave: false,
+            llm: None,
+            write: Some(WriteOptions { force: true }),
+        },
+    )
+    .expect("split mod.rs with force");
+
+    assert!(file.exists(), "mod.rs facade must survive force cleanup");
+    assert!(
+        !module_dir.join("old.rs").exists(),
+        "stale generated sibling files should be removed under --force"
+    );
+    assert!(
+        module_dir.join("types.rs").exists(),
+        "types.rs should be generated beside mod.rs"
+    );
+    compile_check(tmp.path(), "foo");
+}
+
+#[test]
 fn refuses_to_split_a_facade() {
     // Running r2factor on its own output destroys the previous split —
     // the marker guard must fire BEFORE the dry-run, not just before
@@ -304,7 +533,11 @@ pub struct Baz;
 
     let sub_dir = tmp.path().join("demo");
     fs::create_dir_all(&sub_dir).expect("mkdir demo");
-    fs::write(sub_dir.join("existing.rs"), "pub fn helper() -> u32 { 42 }\n").expect("write existing.rs");
+    fs::write(
+        sub_dir.join("existing.rs"),
+        "pub fn helper() -> u32 { 42 }\n",
+    )
+    .expect("write existing.rs");
 
     let opts = SplitOptions {
         use_tokensave: false,
@@ -316,8 +549,7 @@ pub struct Baz;
     // The user-created file must be untouched.
     let existing_src = fs::read_to_string(sub_dir.join("existing.rs")).expect("read existing.rs");
     assert_eq!(
-        existing_src,
-        "pub fn helper() -> u32 { 42 }\n",
+        existing_src, "pub fn helper() -> u32 { 42 }\n",
         "existing.rs should be preserved"
     );
 
@@ -333,7 +565,10 @@ pub struct Baz;
     );
 
     // The newly-generated types.rs must also be present.
-    assert!(sub_dir.join("types.rs").exists(), "types.rs should be generated");
+    assert!(
+        sub_dir.join("types.rs").exists(),
+        "types.rs should be generated"
+    );
 
     compile_check(tmp.path(), "demo");
 }
@@ -368,7 +603,10 @@ pub struct Baz;
 
     // The conflicting file must NOT have been overwritten.
     let types_src = fs::read_to_string(sub_dir.join("types.rs")).expect("read types.rs");
-    assert_eq!(types_src, "// old\n", "types.rs should still be the original");
+    assert_eq!(
+        types_src, "// old\n",
+        "types.rs should still be the original"
+    );
 }
 
 #[test]

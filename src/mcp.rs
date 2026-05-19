@@ -139,7 +139,7 @@ fn split_dry_run_descriptor() -> serde_json::Value {
             "properties": {
                 "file": {
                     "type": "string",
-                    "description": "Absolute or cwd-relative path to a .rs file. Cannot be lib.rs, main.rs, or mod.rs.",
+                    "description": "Absolute or cwd-relative path to a .rs file. lib.rs and mod.rs are supported; main.rs is not yet supported.",
                 },
                 "use_tokensave": {
                     "type": "boolean",
@@ -154,7 +154,7 @@ fn split_dry_run_descriptor() -> serde_json::Value {
 fn split_write_descriptor() -> serde_json::Value {
     serde_json::json!({
         "name": "split_write",
-        "description": "DESTRUCTIVE: replace the input .rs file with a facade module and write the proposed sub-modules into a sibling directory of the same stem. The original is backed up to <file>.bak. Run `split_dry_run` first to preview.",
+        "description": "DESTRUCTIVE: replace the input .rs file with a facade module and write the proposed sub-modules. Normal files use a sibling directory, lib.rs uses lib/, and mod.rs writes beside the facade. The original is backed up to <file>.bak. Run `split_dry_run` first to preview.",
         "inputSchema": {
             "type": "object",
             "properties": {

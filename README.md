@@ -60,6 +60,12 @@ crates/foo/src/big/tests.rs      (#[cfg(test)] items)
 crates/foo/src/big.rs.bak        (timestamped original)
 ```
 
+`lib.rs` and `mod.rs` are supported with Rust-aware layouts. Splitting
+`lib.rs` keeps the facade at `lib.rs`, writes generated files under
+`lib/`, and emits `#[path = "lib/<bucket>.rs"] mod <bucket>;` so child
+modules stay at `crate::<bucket>`. Splitting `foo/mod.rs` keeps the
+facade in place and writes generated files beside it under `foo/`.
+
 ---
 
 ## Install
@@ -92,7 +98,7 @@ r2factor split <file> [--write] [--force] [--no-tokensave] [--llm ...]
 |---|---|
 | (none) | Dry-run. Prints the proposed split + cohesion report to stdout. No files touched. |
 | `--write` | Materialize the split. Writes the facade + sub-files. Creates `<file>.bak`. |
-| `--force` | Required only if a sibling `<stem>/` directory already exists; purges its top-level `.rs` files first. |
+| `--force` | Required when generated bucket files would overwrite existing files; also purges stale generated `.rs` files in the split target. |
 | `--no-tokensave` | Skip the tokensave cross-symbol index even if a `.tokensave/` is found in an ancestor directory. |
 | `--llm` | Run an LLM advisor pass over the deterministic plan (renames misc-bucket names, moves obvious misplacements). |
 | `--llm-endpoint <url>` | OpenAI-compatible endpoint (default: local Ollama on `:11434`). |
@@ -295,7 +301,7 @@ Non-destructive. Analyze a file and return the proposed plan.
 
 | field | type | required | default | meaning |
 |---|---|---|---|---|
-| `file` | string | yes | — | Absolute or cwd-relative path to a `.rs` file. Cannot be `lib.rs`, `main.rs`, or `mod.rs` (those are blocked by the splitter). |
+| `file` | string | yes | — | Absolute or cwd-relative path to a `.rs` file. `lib.rs` and `mod.rs` are supported; `main.rs` is not yet supported. |
 | `use_tokensave` | bool | no | `true` | If a `.tokensave/` database is found in an ancestor directory, fold its cross-symbol edges into the clustering signal. |
 
 **Returns** (as the text content of the tool result)

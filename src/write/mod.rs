@@ -14,8 +14,8 @@ use crate::promote::{
     CrossImport, RefContext, compute_cross_imports, compute_facade_imports, compute_field_lifts,
     compute_impl_lifts, compute_promotions,
 };
-use std::collections::HashSet;
 use anyhow::{Context, Result, anyhow, bail};
+use std::collections::HashSet;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -61,20 +61,80 @@ pub struct WriteReport {
     pub facade: PathBuf,
 }
 
+struct SplitLayout {
+    primary_bucket: String,
+    target_dir: PathBuf,
+    facade_path_prefix: Option<String>,
+    exclude_existing_file: Option<PathBuf>,
+    remove_target_dir_if_empty: bool,
+}
+
+impl SplitLayout {
+    fn for_path(original: &Path) -> Result<Self> {
+        let parent = original.parent().unwrap_or(Path::new("."));
+        let file_name = original
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| anyhow!("invalid file name in {}", original.display()))?;
+        let stem = original
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| anyhow!("invalid file stem in {}", original.display()))?;
+
+        match file_name {
+            "main.rs" => bail!(
+                "splitting `main.rs` is not supported yet — split a regular module, `lib.rs`, or `mod.rs`"
+            ),
+            "lib.rs" => Ok(Self {
+                primary_bucket: "lib".to_string(),
+                target_dir: parent.join("lib"),
+                facade_path_prefix: Some("lib".to_string()),
+                exclude_existing_file: None,
+                remove_target_dir_if_empty: true,
+            }),
+            "mod.rs" => {
+                let primary = parent.file_name().and_then(|s| s.to_str()).ok_or_else(|| {
+                    anyhow!("cannot infer module name for {}", original.display())
+                })?;
+                Ok(Self {
+                    primary_bucket: primary.to_string(),
+                    target_dir: parent.to_path_buf(),
+                    facade_path_prefix: None,
+                    exclude_existing_file: Some(original.to_path_buf()),
+                    remove_target_dir_if_empty: false,
+                })
+            }
+            _ => Ok(Self {
+                primary_bucket: stem.to_string(),
+                target_dir: parent.join(stem),
+                facade_path_prefix: None,
+                exclude_existing_file: None,
+                remove_target_dir_if_empty: true,
+            }),
+        }
+    }
+
+    fn includes_existing_module_file(&self, path: &Path) -> bool {
+        if !path.is_file() || !path.extension().is_some_and(|ext| ext == "rs") {
+            return false;
+        }
+        if let Some(exclude) = &self.exclude_existing_file {
+            if same_path(path, exclude) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 pub fn write_plan(
     original: &Path,
     plan: &Plan,
     items: &[ParsedItem],
     opts: &WriteOptions,
 ) -> Result<WriteReport> {
-    let parent = original.parent().unwrap_or(Path::new("."));
-    let stem = original
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| anyhow!("invalid file stem in {}", original.display()))?;
-    if matches!(stem, "lib" | "main" | "mod") {
-        bail!("splitting `{stem}.rs` is not supported in v0 — choose a regular module file");
-    }
+    let layout = SplitLayout::for_path(original)?;
+    let stem = layout.primary_bucket.as_str();
 
     // Refuse to split our own output. The pipeline already bails for the
     // common case, but this is the last-line guard before we destroy
@@ -86,13 +146,12 @@ pub fn write_plan(
             original.display()
         );
     }
-    let target_dir = parent.join(stem);
+    let target_dir = layout.target_dir.clone();
 
     // 1) Backup FIRST. If this fails, we abort with no destruction.
     let backup = make_backup_path(original)?;
-    fs::copy(original, &backup).with_context(|| {
-        format!("backup {} -> {}", original.display(), backup.display())
-    })?;
+    fs::copy(original, &backup)
+        .with_context(|| format!("backup {} -> {}", original.display(), backup.display()))?;
 
     // 2) Source preamble: inner attrs/doc-mod comments. The full set of
     //    `use` items is gathered as ParsedItem refs so we can pick a
@@ -146,7 +205,7 @@ pub fn write_plan(
             .filter_map(|e| e.ok())
             .filter_map(|e| {
                 let p = e.path();
-                if p.is_file() && p.extension().is_some_and(|ext| ext == "rs") {
+                if layout.includes_existing_module_file(&p) {
                     p.file_stem().and_then(|s| s.to_str()).map(String::from)
                 } else {
                     None
@@ -176,9 +235,10 @@ pub fn write_plan(
         for entry in fs::read_dir(&target_dir)
             .with_context(|| format!("read_dir {}", target_dir.display()))?
         {
-            let entry = entry.with_context(|| format!("read_dir entry in {}", target_dir.display()))?;
+            let entry =
+                entry.with_context(|| format!("read_dir entry in {}", target_dir.display()))?;
             let path = entry.path();
-            if path.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
+            if layout.includes_existing_module_file(&path) {
                 let file_stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
                 let is_conflicting = planned_files.contains(file_stem);
                 let is_stale_generated = !planned_files.contains(file_stem) && {
@@ -201,7 +261,7 @@ pub fn write_plan(
             .filter_map(|e| e.ok())
             .filter_map(|e| {
                 let p = e.path();
-                if p.is_file() && p.extension().is_some_and(|ext| ext == "rs") {
+                if layout.includes_existing_module_file(&p) {
                     p.file_stem().and_then(|s| s.to_str()).map(String::from)
                 } else {
                     None
@@ -213,8 +273,7 @@ pub fn write_plan(
     };
 
     // 3) Sub-files.
-    fs::create_dir_all(&target_dir)
-        .with_context(|| format!("mkdir {}", target_dir.display()))?;
+    fs::create_dir_all(&target_dir).with_context(|| format!("mkdir {}", target_dir.display()))?;
 
     let mut written: Vec<PathBuf> = Vec::new();
     let mut sub_modules: Vec<String> = Vec::new();
@@ -259,7 +318,7 @@ pub fn write_plan(
     }
     sub_modules.sort();
 
-    let kept_target_dir = if sub_modules.is_empty() {
+    let kept_target_dir = if sub_modules.is_empty() && layout.remove_target_dir_if_empty {
         match fs::remove_dir(&target_dir) {
             Ok(()) => None,
             Err(e) => {
@@ -282,6 +341,7 @@ pub fn write_plan(
         &facade_uses,
         &facade_primary,
         &sub_modules,
+        layout.facade_path_prefix.as_deref(),
         &promote,
         &impl_lifts,
         &facade_imports,
@@ -295,6 +355,13 @@ pub fn write_plan(
         written_files: written,
         facade: original.to_path_buf(),
     })
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
 }
 
 /// Pick the subset of `all_uses` that the bucket actually references and
@@ -379,7 +446,10 @@ fn rename_assignments(
     }
     let mut out: BTreeMap<String, Vec<ItemId>> = BTreeMap::new();
     for (bucket, ids) in src {
-        let key = renames.get(bucket).cloned().unwrap_or_else(|| bucket.clone());
+        let key = renames
+            .get(bucket)
+            .cloned()
+            .unwrap_or_else(|| bucket.clone());
         out.entry(key).or_default().extend(ids.iter().copied());
     }
     out
@@ -432,5 +502,3 @@ fn rename_facade_imports(
         })
         .collect()
 }
-
-
