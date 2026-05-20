@@ -10,9 +10,15 @@ use crate::plan::{self, Plan};
 use crate::tokensave::{CrossFileEvidence, Tokensave};
 use crate::write::{self, WriteReport};
 use anyhow::Result;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+const DEFAULT_RECURSIVE_MAX_LINES: usize = 1000;
 
 pub fn run_split(path: &Path, opts: SplitOptions) -> Result<()> {
+    run_split_inner(path, &opts, 0)
+}
+
+fn run_split_inner(path: &Path, opts: &SplitOptions, depth: usize) -> Result<()> {
     let src = std::fs::read_to_string(path)?;
     // Refuse early — feeding an r2factor facade back through the pipeline
     // produces a degenerate plan that, if written, would delete the
@@ -44,9 +50,49 @@ pub fn run_split(path: &Path, opts: SplitOptions) -> Result<()> {
     if let Some(write_opts) = opts.write {
         let report = write::write_plan(path, &plan, &items, &write_opts)?;
         report_write(&report);
+        recursively_split_written(&report, opts, depth)?;
     }
 
     Ok(())
+}
+
+fn recursively_split_written(
+    report: &WriteReport,
+    opts: &SplitOptions,
+    depth: usize,
+) -> Result<()> {
+    let Some(write_opts) = opts.write else {
+        return Ok(());
+    };
+    let max_lines = write_opts
+        .recursive_max_lines
+        .unwrap_or(DEFAULT_RECURSIVE_MAX_LINES);
+    if max_lines == 0 {
+        return Ok(());
+    }
+    for path in oversized_written_files(&report.written_files, max_lines)? {
+        eprintln!(
+            "[write] recursive split depth={} -> {} (>{max_lines} lines)",
+            depth + 1,
+            path.display()
+        );
+        run_split_inner(&path, opts, depth + 1)?;
+    }
+    Ok(())
+}
+
+fn oversized_written_files(paths: &[PathBuf], max_lines: usize) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for path in paths {
+        let src = std::fs::read_to_string(path)?;
+        if write::is_r2factor_facade(&src) {
+            continue;
+        }
+        if src.lines().count() > max_lines {
+            out.push(path.clone());
+        }
+    }
+    Ok(out)
 }
 
 fn load_evidence(path: &Path, items: &[ParsedItem]) -> Option<CrossFileEvidence> {

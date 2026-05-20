@@ -16,7 +16,10 @@ fn split_in_tempdir(stem: &str, src: &str) -> (tempfile::TempDir, PathBuf) {
         SplitOptions {
             use_tokensave: false,
             llm: None,
-            write: Some(WriteOptions { force: false }),
+            write: Some(WriteOptions {
+                force: false,
+                recursive_max_lines: Some(0),
+            }),
         },
     )
     .expect("split");

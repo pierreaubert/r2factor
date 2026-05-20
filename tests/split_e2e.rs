@@ -32,7 +32,10 @@ fn split_in_tempdir(stem: &str, src_text: &str) -> (tempfile::TempDir, PathBuf, 
         // explicitly keeps the test output noise-free.
         use_tokensave: false,
         llm: None,
-        write: Some(WriteOptions { force: false }),
+        write: Some(WriteOptions {
+            force: false,
+            recursive_max_lines: Some(0),
+        }),
     };
     run_split(&file, opts).expect("run_split succeeds");
 
@@ -210,6 +213,55 @@ fn normalize(s: &str) -> String { s.trim().to_lowercase() }
 }
 
 #[test]
+fn unit_tests_follow_tested_bucket_and_cross_bucket_tests_stay_in_tests() {
+    let src = r#"pub struct Parser;
+
+impl Parser {
+    pub fn parse(&self, input: &str) -> usize { input.len() }
+}
+
+pub struct Lexer;
+
+impl Lexer {
+    pub fn lex(&self, input: &str) -> usize { input.bytes().count() }
+}
+
+#[test]
+fn parser_unit_test() {
+    assert_eq!(Parser.parse("abc"), 3);
+}
+
+#[test]
+fn parser_lexer_integration_test() {
+    assert_eq!(Parser.parse("abc"), Lexer.lex("abc"));
+}
+"#;
+    let (tmp, _facade, sub_dir) = split_in_tempdir("test_place", src);
+
+    let parser_src = fs::read_to_string(sub_dir.join("parser.rs")).expect("parser.rs");
+    assert!(
+        parser_src.contains("fn parser_unit_test"),
+        "Parser-only unit test should live with parser bucket; got:\n{parser_src}"
+    );
+    assert!(
+        !parser_src.contains("fn parser_lexer_integration_test"),
+        "cross-bucket test should not live in parser bucket; got:\n{parser_src}"
+    );
+
+    let tests_src = fs::read_to_string(sub_dir.join("tests.rs")).expect("tests.rs");
+    assert!(
+        tests_src.contains("fn parser_lexer_integration_test"),
+        "cross-bucket test should live in tests.rs; got:\n{tests_src}"
+    );
+    assert!(
+        !tests_src.contains("fn parser_unit_test"),
+        "unit test should not be stranded in tests.rs; got:\n{tests_src}"
+    );
+
+    compile_check(tmp.path(), "test_place");
+}
+
+#[test]
 fn facade_primary_referencing_promoted_helper_compiles() {
     // The stem-bucket primary (`Cf3`, since stem is "cf3") references a
     // private `load_config` fn that ends up in a sub-bucket. Without
@@ -287,7 +339,7 @@ fn make() -> Tagged { Tagged(7) }
 }
 
 #[test]
-fn splits_lib_rs_with_path_attributed_child_modules() {
+fn splits_isolated_lib_rs_into_sibling_modules() {
     let src = r#"#![allow(dead_code)]
 
 macro_rules! answer {
@@ -316,37 +368,115 @@ fn test_only() {
         SplitOptions {
             use_tokensave: false,
             llm: None,
-            write: Some(WriteOptions { force: false }),
+            write: Some(WriteOptions {
+                force: false,
+                recursive_max_lines: Some(0),
+            }),
         },
     )
     .expect("split lib.rs");
 
     let lib_dir = tmp.path().join("lib");
     assert!(
-        lib_dir.join("types.rs").exists(),
-        "types.rs should be generated under lib/"
+        tmp.path().join("types.rs").exists(),
+        "types.rs should be generated beside isolated lib.rs"
     );
     assert!(
-        lib_dir.join("macros.rs").exists(),
-        "macros.rs should be generated under lib/"
+        tmp.path().join("macros.rs").exists(),
+        "macros.rs should be generated beside isolated lib.rs"
     );
     assert!(
-        lib_dir.join("tests.rs").exists(),
-        "tests.rs should be generated under lib/"
+        !tmp.path().join("tests.rs").exists(),
+        "single-bucket unit tests should stay with their tested code instead of creating tests.rs"
+    );
+    assert!(
+        !lib_dir.exists(),
+        "isolated lib.rs should not create a lib/ subdirectory"
     );
 
     let facade_src = fs::read_to_string(&file).expect("read generated lib.rs");
     assert!(
+        facade_src.contains("mod types;"),
+        "isolated lib.rs facade should use normal sibling mod declarations; got:\n{facade_src}"
+    );
+    assert!(
+        facade_src.contains("#[macro_use]\nmod macros;"),
+        "isolated lib.rs facade should not path-attribute macros; got:\n{facade_src}"
+    );
+    assert!(
+        !facade_src.contains("#[path = \"lib/"),
+        "isolated lib.rs facade should not use lib/ path attributes; got:\n{facade_src}"
+    );
+    let macros_src = fs::read_to_string(tmp.path().join("macros.rs")).expect("macros.rs");
+    assert!(
+        macros_src.contains("fn test_only"),
+        "unit test for value() should stay with the bucket containing value(); got:\n{macros_src}"
+    );
+
+    assert_parses(&file);
+    for path in [tmp.path().join("types.rs"), tmp.path().join("macros.rs")] {
+        assert_parses(&path);
+    }
+    compile_existing_lib(tmp.path());
+}
+
+#[test]
+fn split_lib_rs_with_existing_lib_dir_uses_path_attributed_child_modules() {
+    let src = r#"#![allow(dead_code)]
+
+macro_rules! answer {
+    () => { 42 };
+}
+
+pub struct Foo;
+pub struct Bar;
+pub struct Baz;
+
+pub fn value() -> u32 {
+    answer!()
+}
+
+#[cfg(test)]
+fn test_only() {
+    assert_eq!(value(), 42);
+}
+"#;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let file = tmp.path().join("lib.rs");
+    fs::write(&file, src).expect("write lib.rs");
+    let lib_dir = tmp.path().join("lib");
+    fs::create_dir_all(&lib_dir).expect("mkdir lib");
+    fs::write(
+        lib_dir.join("existing.rs"),
+        "pub fn helper() -> u32 { 42 }\n",
+    )
+    .expect("write existing.rs");
+
+    run_split(
+        &file,
+        SplitOptions {
+            use_tokensave: false,
+            llm: None,
+            write: Some(WriteOptions {
+                force: false,
+                recursive_max_lines: Some(0),
+            }),
+        },
+    )
+    .expect("split lib.rs");
+
+    assert!(
+        lib_dir.join("types.rs").exists(),
+        "types.rs should be generated under existing lib/"
+    );
+    let facade_src = fs::read_to_string(&file).expect("read generated lib.rs");
+    assert!(
         facade_src.contains("#[path = \"lib/types.rs\"]\nmod types;"),
-        "lib.rs facade should path-attribute normal modules; got:\n{facade_src}"
+        "lib.rs facade should path-attribute generated modules when lib/ exists; got:\n{facade_src}"
     );
     assert!(
-        facade_src.contains("#[macro_use]\n#[path = \"lib/macros.rs\"]\nmod macros;"),
-        "lib.rs facade should stack macro_use before the path attribute; got:\n{facade_src}"
-    );
-    assert!(
-        facade_src.contains("#[cfg(test)]\n#[path = \"lib/tests.rs\"]\nmod tests;"),
-        "lib.rs facade should stack cfg(test) before the path attribute; got:\n{facade_src}"
+        facade_src.contains("#[path = \"lib/existing.rs\"]\nmod existing;"),
+        "existing lib/ modules should remain path-attributed; got:\n{facade_src}"
     );
 
     assert_parses(&file);
@@ -385,7 +515,10 @@ pub fn module_value() -> u32 {
         SplitOptions {
             use_tokensave: false,
             llm: None,
-            write: Some(WriteOptions { force: false }),
+            write: Some(WriteOptions {
+                force: false,
+                recursive_max_lines: Some(0),
+            }),
         },
     )
     .expect("split mod.rs");
@@ -424,15 +557,21 @@ pub struct Baz;
     fs::write(&file, src).expect("write lib.rs");
     let lib_dir = tmp.path().join("lib");
     fs::create_dir_all(&lib_dir).expect("mkdir lib");
-    fs::write(lib_dir.join("existing.rs"), "pub fn helper() -> u32 { 42 }\n")
-        .expect("write existing.rs");
+    fs::write(
+        lib_dir.join("existing.rs"),
+        "pub fn helper() -> u32 { 42 }\n",
+    )
+    .expect("write existing.rs");
 
     run_split(
         &file,
         SplitOptions {
             use_tokensave: false,
             llm: None,
-            write: Some(WriteOptions { force: false }),
+            write: Some(WriteOptions {
+                force: false,
+                recursive_max_lines: Some(0),
+            }),
         },
     )
     .expect("split lib.rs");
@@ -476,7 +615,10 @@ pub struct Baz;
         SplitOptions {
             use_tokensave: false,
             llm: None,
-            write: Some(WriteOptions { force: true }),
+            write: Some(WriteOptions {
+                force: true,
+                recursive_max_lines: Some(0),
+            }),
         },
     )
     .expect("split mod.rs with force");
@@ -542,7 +684,10 @@ pub struct Baz;
     let opts = SplitOptions {
         use_tokensave: false,
         llm: None,
-        write: Some(WriteOptions { force: false }),
+        write: Some(WriteOptions {
+            force: false,
+            recursive_max_lines: Some(0),
+        }),
     };
     run_split(&file, opts).expect("run_split succeeds");
 
@@ -592,7 +737,10 @@ pub struct Baz;
     let opts = SplitOptions {
         use_tokensave: false,
         llm: None,
-        write: Some(WriteOptions { force: false }),
+        write: Some(WriteOptions {
+            force: false,
+            recursive_max_lines: Some(0),
+        }),
     };
     let err = run_split(&file, opts).expect_err("should bail because types.rs exists");
     let msg = format!("{err}");
@@ -628,7 +776,10 @@ pub struct Baz;
     let opts = SplitOptions {
         use_tokensave: false,
         llm: None,
-        write: Some(WriteOptions { force: true }),
+        write: Some(WriteOptions {
+            force: true,
+            recursive_max_lines: Some(0),
+        }),
     };
     run_split(&file, opts).expect("run_split should succeed with force");
 
@@ -640,4 +791,43 @@ pub struct Baz;
     );
 
     compile_check(tmp.path(), "demo");
+}
+
+#[test]
+fn recursively_splits_generated_files_over_line_threshold() {
+    let mut src = String::new();
+    for i in 0..12 {
+        src.push_str(&format!(
+            "pub fn parse_{i}(input: &str) -> usize {{\n    input.len() + {i}\n}}\n\n"
+        ));
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let file = tmp.path().join("recur.rs");
+    fs::write(&file, src).expect("write source");
+
+    run_split(
+        &file,
+        SplitOptions {
+            use_tokensave: false,
+            llm: None,
+            write: Some(WriteOptions {
+                force: false,
+                recursive_max_lines: Some(20),
+            }),
+        },
+    )
+    .expect("recursive split succeeds");
+
+    let parse_file = tmp.path().join("recur").join("parse.rs");
+    let parse_src = fs::read_to_string(&parse_file).expect("read recursive facade");
+    assert!(
+        parse_src.contains("r2factor:facade"),
+        "oversized generated parse.rs should be recursively split into a facade; got:\n{parse_src}"
+    );
+    assert!(
+        tmp.path().join("recur").join("parse.rs.bak").exists(),
+        "recursive split should back up the oversized generated file"
+    );
+    compile_check(tmp.path(), "recur");
 }

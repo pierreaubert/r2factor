@@ -47,8 +47,10 @@ pub fn is_r2factor_facade(src: &str) -> bool {
         .any(|l| l.contains(FACADE_MARKER_NEEDLE))
 }
 
+#[derive(Clone, Copy, Debug)]
 pub struct WriteOptions {
     pub force: bool,
+    pub recursive_max_lines: Option<usize>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -85,13 +87,24 @@ impl SplitLayout {
             "main.rs" => bail!(
                 "splitting `main.rs` is not supported yet — split a regular module, `lib.rs`, or `mod.rs`"
             ),
-            "lib.rs" => Ok(Self {
-                primary_bucket: "lib".to_string(),
-                target_dir: parent.join("lib"),
-                facade_path_prefix: Some("lib".to_string()),
-                exclude_existing_file: None,
-                remove_target_dir_if_empty: true,
-            }),
+            "lib.rs" => {
+                let isolated = is_isolated_lib_rs(parent, original);
+                Ok(Self {
+                    primary_bucket: "lib".to_string(),
+                    target_dir: if isolated {
+                        parent.to_path_buf()
+                    } else {
+                        parent.join("lib")
+                    },
+                    facade_path_prefix: if isolated {
+                        None
+                    } else {
+                        Some("lib".to_string())
+                    },
+                    exclude_existing_file: isolated.then(|| original.to_path_buf()),
+                    remove_target_dir_if_empty: !isolated,
+                })
+            }
             "mod.rs" => {
                 let primary = parent.file_name().and_then(|s| s.to_str()).ok_or_else(|| {
                     anyhow!("cannot infer module name for {}", original.display())
@@ -125,6 +138,25 @@ impl SplitLayout {
         }
         true
     }
+}
+
+fn is_isolated_lib_rs(parent: &Path, original: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(parent) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if same_path(&path, original) {
+            continue;
+        }
+        if path.is_dir() && path.file_name().is_some_and(|name| name == "lib") {
+            return false;
+        }
+        if path.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
+            return false;
+        }
+    }
+    true
 }
 
 pub fn write_plan(
@@ -277,20 +309,22 @@ pub fn write_plan(
 
     let mut written: Vec<PathBuf> = Vec::new();
     let mut sub_modules: Vec<String> = Vec::new();
-    let mut facade_uses: Vec<&ParsedItem> = Vec::new();
+    let mut reexport_modules: BTreeSet<String> = BTreeSet::new();
+    let mut facade_uses: Vec<String> = Vec::new();
     let mut facade_primary: Vec<&ParsedItem> = Vec::new();
 
     // Preserve existing sub-modules that are not part of the current plan.
     for module in &existing_modules {
         if !planned_files.contains(module) {
             sub_modules.push(module.clone());
+            reexport_modules.insert(module.clone());
         }
     }
 
     for (module, ids) in &assignments {
         if module == "mod_root" {
             for id in ids {
-                facade_uses.push(by_id[id]);
+                facade_uses.push(by_id[id].source.clone());
             }
             continue;
         }
@@ -301,8 +335,12 @@ pub fn write_plan(
             continue;
         }
         let path = target_dir.join(format!("{module}.rs"));
-        let bucket_prelude = bucket_use_prelude(ids, &by_id, &all_uses);
-        let imports = cross_imports.get(module).cloned().unwrap_or_default();
+        let bucket_idents = uses::bucket_idents_for(ids, &by_id);
+        let mut imports = cross_imports.get(module).cloned().unwrap_or_default();
+        add_existing_module_imports(&mut imports, bucket_idents.as_ref(), &existing_modules);
+        let known_names = bucket_known_names(ids, &by_id, &imports);
+        let bucket_prelude =
+            bucket_use_prelude_from_idents(bucket_idents.as_ref(), &all_uses, &known_names);
         let body = render_sub_file(
             ids,
             &by_id,
@@ -314,9 +352,14 @@ pub fn write_plan(
         );
         fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
         written.push(path);
+        if module_has_public_items(ids, &by_id) {
+            reexport_modules.insert(module.clone());
+        }
         sub_modules.push(module.clone());
     }
     sub_modules.sort();
+    let facade_primary_ids: Vec<ItemId> = facade_primary.iter().map(|it| it.id).collect();
+    facade_uses = facade_use_prelude(&facade_primary_ids, &by_id, &all_uses);
 
     let kept_target_dir = if sub_modules.is_empty() && layout.remove_target_dir_if_empty {
         match fs::remove_dir(&target_dir) {
@@ -341,6 +384,7 @@ pub fn write_plan(
         &facade_uses,
         &facade_primary,
         &sub_modules,
+        &reexport_modules,
         layout.facade_path_prefix.as_deref(),
         &promote,
         &impl_lifts,
@@ -373,24 +417,82 @@ fn same_path(a: &Path, b: &Path) -> bool {
 /// Falls back to the full (unrebased) prelude if the bucket's source fails
 /// to parse — defensive only, shouldn't trip since each item came through
 /// `syn::parse_file` originally.
-fn bucket_use_prelude(
-    bucket_ids: &[ItemId],
-    by_id: &BTreeMap<ItemId, &ParsedItem>,
+fn bucket_use_prelude_from_idents(
+    idents: Option<&HashSet<String>>,
     all_uses: &[&ParsedItem],
+    known_names: &HashSet<String>,
 ) -> String {
-    let Some(idents) = uses::bucket_idents_for(bucket_ids, by_id) else {
+    let Some(idents) = idents else {
         return all_uses
             .iter()
             .map(|u| uses::rebase_use_for_subfile(&u.source))
             .collect::<Vec<_>>()
             .join("\n");
     };
-    let selected = uses::select_uses_for(all_uses, &idents);
-    selected
+    uses::render_uses_for(all_uses, idents, known_names, true)
+}
+
+fn add_existing_module_imports(
+    imports: &mut BTreeSet<CrossImport>,
+    idents: Option<&HashSet<String>>,
+    existing_modules: &BTreeSet<String>,
+) {
+    let Some(idents) = idents else {
+        return;
+    };
+    for module in existing_modules {
+        if idents.contains(module) {
+            imports.insert(CrossImport {
+                source_bucket: None,
+                name: module.clone(),
+                cfg_attrs: Vec::new(),
+            });
+        }
+    }
+}
+
+fn facade_use_prelude<'a>(
+    facade_ids: &[ItemId],
+    by_id: &BTreeMap<ItemId, &'a ParsedItem>,
+    all_uses: &'a [&'a ParsedItem],
+) -> Vec<String> {
+    let Some(idents) = uses::bucket_idents_for(facade_ids, by_id) else {
+        return all_uses.iter().map(|u| u.source.clone()).collect();
+    };
+    let known_names = facade_ids
         .iter()
-        .map(|u| uses::rebase_use_for_subfile(&u.source))
-        .collect::<Vec<_>>()
-        .join("\n")
+        .filter_map(|id| {
+            let name = &by_id[id].name;
+            (!name.is_empty()).then(|| name.clone())
+        })
+        .collect();
+    uses::render_uses_for(all_uses, &idents, &known_names, false)
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+fn bucket_known_names(
+    ids: &[ItemId],
+    by_id: &BTreeMap<ItemId, &ParsedItem>,
+    imports: &BTreeSet<CrossImport>,
+) -> HashSet<String> {
+    let mut names: HashSet<String> = ids
+        .iter()
+        .filter_map(|id| {
+            let name = &by_id[id].name;
+            (!name.is_empty()).then(|| name.clone())
+        })
+        .collect();
+    for import in imports {
+        names.insert(import.name.clone());
+    }
+    names
+}
+
+fn module_has_public_items(ids: &[ItemId], by_id: &BTreeMap<ItemId, &ParsedItem>) -> bool {
+    ids.iter()
+        .any(|id| by_id[id].vis == crate::item::ItemVis::Public)
 }
 
 /// Compute renames for sub-bucket names that collide with names already in
@@ -467,10 +569,9 @@ fn rename_cross_imports(
         let consumer_new = renames.get(&consumer).cloned().unwrap_or(consumer);
         let entry = out.entry(consumer_new).or_default();
         for c in imports {
-            let src_new = renames
-                .get(&c.source_bucket)
-                .cloned()
-                .unwrap_or(c.source_bucket);
+            let src_new = c
+                .source_bucket
+                .and_then(|source| renames.get(&source).cloned().or(Some(source)));
             entry.insert(CrossImport {
                 source_bucket: src_new,
                 name: c.name,
@@ -490,10 +591,9 @@ fn rename_facade_imports(
     }
     src.into_iter()
         .map(|c| {
-            let src_new = renames
-                .get(&c.source_bucket)
-                .cloned()
-                .unwrap_or(c.source_bucket);
+            let src_new = c
+                .source_bucket
+                .and_then(|source| renames.get(&source).cloned().or(Some(source)));
             CrossImport {
                 source_bucket: src_new,
                 name: c.name,

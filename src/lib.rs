@@ -16,6 +16,7 @@ pub mod write;
 
 pub use pipeline::run_split;
 
+#[derive(Clone)]
 pub struct SplitOptions {
     pub use_tokensave: bool,
     pub llm: Option<llm::LlmConfig>,

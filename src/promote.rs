@@ -161,17 +161,19 @@ pub fn compute_promotions(
     out
 }
 
-/// For each sub-bucket A, the set of `(source_bucket, item_name)` pairs A
-/// needs to import via `use super::<source_bucket>::<item_name>;`. Only
-/// `pub(super)`-promoted items show up here — `pub` items in sibling
-/// buckets already reach A through the facade's `pub use <bkt>::*;`
-/// wildcard chain, and same-bucket items don't need imports.
+/// For each sub-bucket A, the set of item names A needs to import from
+/// sibling buckets or from the facade. This keeps generated sub-files from
+/// relying on a blanket `use super::*;`, which in turn avoids dragging the
+/// facade's entire public surface into every bucket.
 /// A single cross-bucket `use` line to emit: source bucket, item name, and
 /// any `#[cfg(...)]` attributes the use must carry so it stays in lockstep
 /// with the target item's gating.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CrossImport {
-    pub source_bucket: String,
+    /// `None` means the target item lives directly in the facade, so the
+    /// import path is `super::<name>`. `Some(bucket)` means
+    /// `super::<bucket>::<name>`.
+    pub source_bucket: Option<String>,
     pub name: String,
     pub cfg_attrs: Vec<String>,
 }
@@ -179,7 +181,7 @@ pub struct CrossImport {
 pub fn compute_cross_imports(
     ctx: &RefContext<'_>,
     items: &[ParsedItem],
-    promote: &BTreeSet<ItemId>,
+    _promote: &BTreeSet<ItemId>,
     stem: &str,
 ) -> BTreeMap<String, BTreeSet<CrossImport>> {
     let mut out: BTreeMap<String, BTreeSet<CrossImport>> = BTreeMap::new();
@@ -194,20 +196,21 @@ pub fn compute_cross_imports(
             let Some(target_id) = ctx.name_to_id.get(r.as_str()) else {
                 continue;
             };
-            if !promote.contains(target_id) {
-                continue;
-            }
             let Some(target_bucket) = ctx.bucket_of.get(target_id) else {
                 continue;
             };
             if my_bucket == target_bucket {
                 continue;
             }
+            if *target_bucket == "mod_root" {
+                continue;
+            }
             let target = ctx.by_id[target_id];
             out.entry((*my_bucket).clone())
                 .or_default()
                 .insert(CrossImport {
-                    source_bucket: (*target_bucket).clone(),
+                    source_bucket: (!is_facade_bucket(target_bucket, stem))
+                        .then(|| (*target_bucket).clone()),
                     name: target.name.clone(),
                     cfg_attrs: cfg_attrs_of(&target.source),
                 });
@@ -453,7 +456,13 @@ pub fn rebase_pub_super_in_subfile(source: &str) -> String {
     }
     // Find the byte span of the `super` token inside the `pub(...)` and
     // splice in an extra `super::` before it.
-    let super_ident_span = r.path.segments.first().expect("checked length above").ident.span();
+    let super_ident_span = r
+        .path
+        .segments
+        .first()
+        .expect("checked length above")
+        .ident
+        .span();
     let start = super_ident_span.start();
     let Some(pos) = line_col_to_byte_offset(source, start.line, start.column) else {
         return source.to_string();
@@ -538,7 +547,9 @@ fn impl_item_keyword_span(item: &syn::ImplItem) -> Option<proc_macro2::Span> {
         ImplItem::Fn(f) if matches!(f.vis, syn::Visibility::Inherited) => {
             Some(fn_keyword_span(&f.sig))
         }
-        ImplItem::Const(c) if matches!(c.vis, syn::Visibility::Inherited) => Some(c.const_token.span),
+        ImplItem::Const(c) if matches!(c.vis, syn::Visibility::Inherited) => {
+            Some(c.const_token.span)
+        }
         ImplItem::Type(t) if matches!(t.vis, syn::Visibility::Inherited) => Some(t.type_token.span),
         _ => None,
     }
@@ -577,7 +588,7 @@ pub fn compute_facade_imports(
             }
             let target = ctx.by_id[target_id];
             out.insert(CrossImport {
-                source_bucket: (*target_bucket).clone(),
+                source_bucket: Some((*target_bucket).clone()),
                 name: target.name.clone(),
                 cfg_attrs: cfg_attrs_of(&target.source),
             });
@@ -698,8 +709,7 @@ fn collect_from_named(named: &syn::FieldsNamed, source: &str, points: &mut Vec<u
             continue;
         };
         let span = ident.span();
-        if let Some(pos) = line_col_to_byte_offset(source, span.start().line, span.start().column)
-        {
+        if let Some(pos) = line_col_to_byte_offset(source, span.start().line, span.start().column) {
             points.push(pos);
         }
     }
@@ -714,8 +724,7 @@ fn collect_from_unnamed(unnamed: &syn::FieldsUnnamed, source: &str, points: &mut
         // For tuple fields the syntax is `vis? ty` (no ident) — splice
         // before the type.
         let span = field.ty.span();
-        if let Some(pos) = line_col_to_byte_offset(source, span.start().line, span.start().column)
-        {
+        if let Some(pos) = line_col_to_byte_offset(source, span.start().line, span.start().column) {
             points.push(pos);
         }
     }
@@ -975,9 +984,11 @@ mod tests {
         let cross = compute_cross_imports(&ctx, &items, &promote, "sample");
         let parser_imports = cross.get("parser").expect("parser needs imports");
         assert!(
-            parser_imports.iter().any(|c| c.source_bucket == "eval"
-                && c.name == "helper"
-                && c.cfg_attrs.is_empty()),
+            parser_imports
+                .iter()
+                .any(|c| c.source_bucket.as_deref() == Some("eval")
+                    && c.name == "helper"
+                    && c.cfg_attrs.is_empty()),
             "parser should import super::eval::helper with no cfg attrs"
         );
     }
@@ -987,13 +998,7 @@ mod tests {
         // `Helper` lives in mod_root (facade). Children inherit access, so
         // even though `parser` references it cross-bucket, we don't promote.
         let items = vec![
-            fake(
-                0,
-                "Helper",
-                ItemVis::Private,
-                ItemKind::Struct,
-                &[],
-            ),
+            fake(0, "Helper", ItemVis::Private, ItemKind::Struct, &[]),
             fake(
                 1,
                 "parse",
@@ -1028,13 +1033,7 @@ mod tests {
                 ItemKind::Fn { is_test: false },
                 &[],
             ),
-            fake(
-                1,
-                "Sample",
-                ItemVis::Public,
-                ItemKind::Struct,
-                &["helper"],
-            ),
+            fake(1, "Sample", ItemVis::Public, ItemKind::Struct, &["helper"]),
         ];
         let mut plan = Plan::default();
         plan.assign("eval", 0, "");
@@ -1048,7 +1047,7 @@ mod tests {
         assert!(
             facade_imports
                 .iter()
-                .any(|c| c.source_bucket == "eval" && c.name == "helper"),
+                .any(|c| c.source_bucket.as_deref() == Some("eval") && c.name == "helper"),
             "facade should import eval::helper"
         );
 
@@ -1314,7 +1313,10 @@ mod tests {
 
     #[test]
     fn rebase_pub_super_no_op_for_pub() {
-        assert_eq!(rebase_pub_super_in_subfile("pub fn x() {}"), "pub fn x() {}");
+        assert_eq!(
+            rebase_pub_super_in_subfile("pub fn x() {}"),
+            "pub fn x() {}"
+        );
     }
 
     #[test]

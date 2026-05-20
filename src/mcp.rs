@@ -164,6 +164,10 @@ fn split_write_descriptor() -> serde_json::Value {
                     "description": "Overwrite an existing target directory and purge its stale .rs files. Use with care. Defaults to false.",
                 },
                 "use_tokensave": { "type": "boolean" },
+                "max_lines": {
+                    "type": "integer",
+                    "description": "Recursively split generated files above this many lines. Defaults to 1000; use 0 to disable.",
+                },
             },
             "required": ["file"],
         },
@@ -306,7 +310,6 @@ fn tool_split_dry_run(args: &serde_json::Value) -> Result<String, String> {
         .get("use_tokensave")
         .and_then(|b| b.as_bool())
         .unwrap_or(true);
-
     let path = Path::new(file);
     let src = std::fs::read_to_string(path).map_err(|e| format!("read {file}: {e}"))?;
     if crate::write::is_r2factor_facade(&src) {
@@ -338,6 +341,11 @@ fn tool_split_write(args: &serde_json::Value) -> Result<String, String> {
         .get("use_tokensave")
         .and_then(|b| b.as_bool())
         .unwrap_or(true);
+    let max_lines = args
+        .get("max_lines")
+        .and_then(|n| n.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(1000);
 
     let path = Path::new(file);
     let src = std::fs::read_to_string(path).map_err(|e| format!("read {file}: {e}"))?;
@@ -354,9 +362,29 @@ fn tool_split_write(args: &serde_json::Value) -> Result<String, String> {
     };
     crate::graph::annotate_refs(&mut items, evidence.as_ref());
     let plan = crate::plan::build(&items);
-    let opts = crate::write::WriteOptions { force };
+    let opts = crate::write::WriteOptions {
+        force,
+        recursive_max_lines: Some(max_lines),
+    };
     let report =
         crate::write::write_plan(path, &plan, &items, &opts).map_err(|e| format!("write: {e}"))?;
+    if max_lines > 0 {
+        for path in &report.written_files {
+            let src = std::fs::read_to_string(path)
+                .map_err(|e| format!("read generated {}: {e}", path.display()))?;
+            if src.lines().count() > max_lines {
+                crate::pipeline::run_split(
+                    path,
+                    crate::SplitOptions {
+                        use_tokensave,
+                        llm: None,
+                        write: Some(opts),
+                    },
+                )
+                .map_err(|e| format!("recursive split {}: {e}", path.display()))?;
+            }
+        }
+    }
     serde_json::to_string_pretty(&report).map_err(|e| e.to_string())
 }
 

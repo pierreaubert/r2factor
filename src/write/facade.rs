@@ -10,9 +10,10 @@ use std::fmt::Write;
 /// the file stem (these would otherwise round-trip through `<stem>/<stem>.rs`).
 pub fn render_facade(
     inner_attrs: &str,
-    facade_uses: &[&ParsedItem],
+    facade_uses: &[String],
     facade_primary: &[&ParsedItem],
     sub_modules: &[String],
+    reexport_modules: &BTreeSet<String>,
     path_prefix: Option<&str>,
     promote: &BTreeSet<ItemId>,
     impl_lifts: &BTreeSet<ItemId>,
@@ -30,7 +31,7 @@ pub fn render_facade(
     );
 
     for it in facade_uses {
-        buf.push_str(&it.source);
+        buf.push_str(it);
         buf.push('\n');
     }
     if !facade_uses.is_empty() {
@@ -64,12 +65,15 @@ pub fn render_facade(
     // Skip `pub use macros::*;` — `macro_rules!` are not items and aren't
     // re-exportable that way. They reach siblings via `#[macro_use]` above.
     for m in sub_modules {
-        if m == "tests" || m == "macros" {
+        if m == "tests" || m == "macros" || !reexport_modules.contains(m) {
             continue;
         }
         let _ = writeln!(buf, "pub use {m}::*;");
     }
-    if sub_modules.iter().any(|m| m != "tests" && m != "macros") {
+    if sub_modules
+        .iter()
+        .any(|m| m != "tests" && m != "macros" && reexport_modules.contains(m))
+    {
         buf.push('\n');
     }
 
@@ -82,12 +86,14 @@ pub fn render_facade(
             for cfg in &imp.cfg_attrs {
                 let _ = writeln!(buf, "{cfg}");
             }
-            let _ = writeln!(
-                buf,
-                "use {src}::{name};",
-                src = imp.source_bucket,
-                name = imp.name
-            );
+            match &imp.source_bucket {
+                Some(src) => {
+                    let _ = writeln!(buf, "use {src}::{name};", name = imp.name);
+                }
+                None => {
+                    let _ = writeln!(buf, "use {name};", name = imp.name);
+                }
+            }
         }
         buf.push('\n');
     }

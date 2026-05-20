@@ -67,6 +67,9 @@ enum Cmd {
         /// When writing, overwrite an existing target directory.
         #[arg(long, requires = "write")]
         force: bool,
+        /// Recursively split generated files above this many lines. Use 0 to disable.
+        #[arg(long, requires = "write", default_value_t = 1000)]
+        max_lines: usize,
     },
 }
 
@@ -125,6 +128,7 @@ fn main() -> Result<()> {
             llm_api_key,
             write,
             force,
+            max_lines,
         } => {
             let opts = SplitOptions {
                 use_tokensave: !no_tokensave,
@@ -134,7 +138,10 @@ fn main() -> Result<()> {
                     timeout_secs: 120,
                     api_key: llm_api_key,
                 }),
-                write: write.then_some(WriteOptions { force }),
+                write: write.then_some(WriteOptions {
+                    force,
+                    recursive_max_lines: Some(max_lines),
+                }),
             };
             r2factor::run_split(&file, opts)
         }

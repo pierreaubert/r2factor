@@ -2,20 +2,6 @@ use crate::item::{ItemId, ItemKind, ItemVis, ParsedItem};
 use crate::plan::Plan;
 use std::collections::BTreeSet;
 
-/// Items annotated `#[cfg(test)]` (or test fns) → `tests`.
-pub fn carve_tests(items: &[ParsedItem], plan: &mut Plan, unassigned: &mut BTreeSet<ItemId>) {
-    for it in items {
-        if !unassigned.contains(&it.id) {
-            continue;
-        }
-        let is_test_fn = matches!(it.kind, ItemKind::Fn { is_test: true });
-        if it.is_cfg_test || is_test_fn {
-            plan.assign("tests", it.id, "cfg(test) / #[test]");
-            unassigned.remove(&it.id);
-        }
-    }
-}
-
 /// `macro_rules!` definitions → `macros`. They must be defined before use,
 /// so consolidating them at the top of the module tree avoids order surprises.
 ///
@@ -55,7 +41,9 @@ pub fn carve_macros(items: &[ParsedItem], plan: &mut Plan, unassigned: &mut BTre
 pub fn carve_errors(items: &[ParsedItem], plan: &mut Plan, unassigned: &mut BTreeSet<ItemId>) {
     let error_types: BTreeSet<String> = items
         .iter()
-        .filter(|i| matches!(i.kind, ItemKind::Struct | ItemKind::Enum) && looks_like_error(&i.name))
+        .filter(|i| {
+            matches!(i.kind, ItemKind::Struct | ItemKind::Enum) && looks_like_error(&i.name)
+        })
         .map(|i| i.name.clone())
         .collect();
 
@@ -140,7 +128,10 @@ pub fn carve_types(items: &[ParsedItem], plan: &mut Plan, unassigned: &mut BTree
                 data_no_impls.contains(&it.name)
             }
             ItemKind::Trait => public_widely_impl_traits.contains(&it.name),
-            ItemKind::Impl { self_ty, trait_path } => {
+            ItemKind::Impl {
+                self_ty,
+                trait_path,
+            } => {
                 if let Some(tp) = trait_path {
                     let last = tp.rsplit("::").next().unwrap_or(tp);
                     public_widely_impl_traits.contains(last)

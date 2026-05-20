@@ -12,6 +12,7 @@
 
 use crate::item::{ItemId, ItemKind, ParsedItem};
 use crate::promote::line_col_to_byte_offset;
+use quote::ToTokens;
 use std::collections::{BTreeMap, HashSet};
 use syn::UseTree;
 use syn::visit::{self, Visit};
@@ -58,7 +59,9 @@ fn collect_tree(tree: &UseTree, out: &mut Vec<String>) {
 /// the side of "keep everything" by returning a wildcard set.
 pub fn bucket_idents(bucket_source: &str) -> Option<HashSet<String>> {
     let file = syn::parse_file(bucket_source).ok()?;
-    let mut v = IdentCollector { found: HashSet::new() };
+    let mut v = IdentCollector {
+        found: HashSet::new(),
+    };
     visit::visit_file(&mut v, &file);
     Some(v.found)
 }
@@ -92,22 +95,120 @@ pub fn bucket_idents_for(
     bucket_idents(&buf)
 }
 
-/// Pick the subset of `all_uses` whose bindings overlap `idents`. Glob
-/// imports are always kept because we can't tell statically what they
-/// introduce.
-pub fn select_uses_for<'a>(
-    all_uses: &'a [&ParsedItem],
+/// Render only the bindings from `all_uses` that are actually referenced by
+/// `idents`. This also prunes inside grouped imports
+/// (`use foo::{A, B};` -> `use foo::A;` when only `A` is used).
+pub fn render_uses_for(
+    all_uses: &[&ParsedItem],
     idents: &HashSet<String>,
-) -> Vec<&'a ParsedItem> {
+    known_names: &HashSet<String>,
+    rebase: bool,
+) -> String {
+    let mut provided = known_names.clone();
+    for builtin in [
+        "Self", "Ok", "Err", "Some", "None", "Option", "Result", "Vec", "Box", "String", "Default",
+    ] {
+        provided.insert(builtin.to_string());
+    }
+    for u in all_uses {
+        for binding in use_bindings(u) {
+            if binding != GLOB {
+                provided.insert(binding);
+            }
+        }
+    }
+    let keep_globs = idents
+        .iter()
+        .any(|ident| is_type_like_ident(ident) && !provided.contains(ident));
+
     all_uses
         .iter()
-        .copied()
-        .filter(|u| {
-            let bindings = use_bindings(u);
-            bindings.is_empty()
-                || bindings.iter().any(|n| n == GLOB || idents.contains(n))
+        .filter_map(|u| filter_use_for(u, idents, keep_globs))
+        .map(|src| {
+            if rebase {
+                rebase_use_for_subfile(&src)
+            } else {
+                src
+            }
         })
-        .collect()
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn filter_use_for(
+    use_item: &ParsedItem,
+    idents: &HashSet<String>,
+    keep_globs: bool,
+) -> Option<String> {
+    let bindings = use_bindings(use_item);
+    if !bindings.is_empty()
+        && bindings
+            .iter()
+            .all(|name| name == GLOB && keep_globs || binding_is_used(name, idents))
+    {
+        return Some(use_item.source.clone());
+    }
+    let mut parsed: syn::ItemUse = syn::parse_str(&use_item.source).ok()?;
+    parsed.tree = filter_tree(parsed.tree, idents, keep_globs)?;
+    let mut rendered = parsed.to_token_stream().to_string();
+    if !rendered.ends_with(';') {
+        rendered.push(';');
+    }
+    Some(rendered)
+}
+
+fn filter_tree(tree: UseTree, idents: &HashSet<String>, keep_globs: bool) -> Option<UseTree> {
+    match tree {
+        UseTree::Path(mut p) => {
+            p.tree = Box::new(filter_tree(*p.tree, idents, keep_globs)?);
+            Some(UseTree::Path(p))
+        }
+        UseTree::Name(n) => {
+            binding_is_used(&n.ident.to_string(), idents).then_some(UseTree::Name(n))
+        }
+        UseTree::Rename(r) => idents
+            .contains(&r.rename.to_string())
+            .then_some(UseTree::Rename(r)),
+        UseTree::Group(mut g) => {
+            g.items = g
+                .items
+                .into_iter()
+                .filter_map(|tree| filter_tree(tree, idents, keep_globs))
+                .collect();
+            (!g.items.is_empty()).then_some(UseTree::Group(g))
+        }
+        UseTree::Glob(g) => keep_globs.then_some(UseTree::Glob(g)),
+    }
+}
+
+fn is_type_like_ident(ident: &str) -> bool {
+    ident
+        .chars()
+        .next()
+        .is_some_and(|c| c == '_' || c.is_ascii_uppercase())
+}
+
+fn binding_is_used(binding: &str, idents: &HashSet<String>) -> bool {
+    idents.contains(binding) || trait_method_hint_is_used(binding, idents)
+}
+
+fn trait_method_hint_is_used(binding: &str, idents: &HashSet<String>) -> bool {
+    match binding {
+        "AsGenericAudioBufferRef" => idents.contains("as_generic_audio_buffer_ref"),
+        "AudioMut" => idents.contains("plane_mut") || idents.contains("plane_pair_mut"),
+        "MediaSource" => idents.contains("is_seekable"),
+        "ReadBytes" => {
+            idents.contains("pos")
+                || idents.contains("ignore_bytes")
+                || idents.contains("read_byte")
+                || idents.contains("read_i16")
+                || idents.contains("read_u16")
+                || idents.contains("read_u32")
+                || idents.contains("read_quad_bytes")
+        }
+        "Seek" => idents.contains("seek"),
+        _ => false,
+    }
 }
 
 /// Rewrite a single `use` item so it works from inside a sub-file. Sub-files
@@ -242,4 +343,3 @@ mod tests {
         assert_eq!(rebase_use_for_subfile("not a use stmt"), "not a use stmt");
     }
 }
-
