@@ -1,5 +1,6 @@
 pub mod carve;
 pub mod cluster;
+pub mod combine;
 pub mod consolidate;
 pub mod flatten;
 pub mod graph;

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use r2factor::SplitOptions;
+use r2factor::combine::CombineOptions;
 use r2factor::llm::LlmConfig;
 use r2factor::write::WriteOptions;
 use std::path::PathBuf;
@@ -18,6 +19,36 @@ enum Cmd {
     /// Lets an MCP-aware client (Claude Code, IDE extensions, etc.)
     /// discover and call `split_dry_run` and `split_write` as tools.
     Mcp,
+    /// Combine two peer `.rs` files into a new parent module directory.
+    /// Generates a facade with mod declarations and re-exports, rewrites
+    /// paths, and updates the parent module declaration.
+    Combine {
+        /// First `.rs` file to combine.
+        file1: PathBuf,
+        /// Second `.rs` file to combine.
+        file2: PathBuf,
+        /// Name for the new parent module directory.
+        #[arg(long)]
+        name: Option<String>,
+        /// Actually perform the combine. Without this, runs in dry-run mode.
+        #[arg(long)]
+        write: bool,
+        /// Overwrite an existing target directory.
+        #[arg(long, requires = "write")]
+        force: bool,
+        /// Output dry-run plan as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Show consumer impact report (requires tokensave).
+        #[arg(long)]
+        preview_impacts: bool,
+        /// Skip tokensave discovery even if available.
+        #[arg(long)]
+        no_tokensave: bool,
+        /// Filter pattern for re-exports (regex).
+        #[arg(long)]
+        re_export_filter: Option<String>,
+    },
     /// Consolidate `foo.rs + foo/` (or `foo/mod.rs + foo/*.rs`) back into
     /// a single `.rs` file. Inverse of `split`. Without --write, just
     /// prints the merged content to stdout.
@@ -116,6 +147,45 @@ fn main() -> Result<()> {
             } else {
                 let flattened = r2factor::flatten::flatten_dry_run(&file)?;
                 println!("{flattened}");
+                Ok(())
+            }
+        }
+        Cmd::Combine {
+            file1,
+            file2,
+            name,
+            write,
+            force,
+            json,
+            preview_impacts,
+            no_tokensave,
+            re_export_filter,
+        } => {
+            let opts = CombineOptions {
+                module_name: name,
+                write,
+                force,
+                json,
+                preview_impacts,
+                use_tokensave: !no_tokensave,
+                re_export_filter,
+            };
+            if write {
+                let report = r2factor::combine::combine_write(&file1, &file2, &opts)?;
+                eprintln!("[combine] facade -> {}", report.facade_path.display());
+                for m in &report.moved_files {
+                    eprintln!("[combine] moved {} -> {}", m.from.display(), m.to.display());
+                }
+                if let Some(p) = &report.parent_update {
+                    eprintln!("[combine] parent -> {} (add `{}`, remove {:?})", p.path.display(), p.add, p.remove);
+                }
+                for b in &report.backups {
+                    eprintln!("[combine] backup -> {}", b.display());
+                }
+                Ok(())
+            } else {
+                let report = r2factor::combine::combine_dry_run(&file1, &file2, &opts)?;
+                println!("{report}");
                 Ok(())
             }
         }

@@ -122,6 +122,8 @@ fn handle_tools_list() -> serde_json::Value {
         "tools": [
             split_dry_run_descriptor(),
             split_write_descriptor(),
+            combine_dry_run_descriptor(),
+            combine_write_descriptor(),
             consolidate_dry_run_descriptor(),
             consolidate_write_descriptor(),
             flatten_dry_run_descriptor(),
@@ -187,6 +189,8 @@ fn handle_tools_call(params: serde_json::Value) -> Result<serde_json::Value, Str
     let outcome = match name {
         "split_dry_run" => tool_split_dry_run(&arguments),
         "split_write" => tool_split_write(&arguments),
+        "combine_dry_run" => tool_combine_dry_run(&arguments),
+        "combine_write" => tool_combine_write(&arguments),
         "consolidate_dry_run" => tool_consolidate_dry_run(&arguments),
         "consolidate_write" => tool_consolidate_write(&arguments),
         "flatten_dry_run" => tool_flatten_dry_run(&arguments),
@@ -206,6 +210,87 @@ fn handle_tools_call(params: serde_json::Value) -> Result<serde_json::Value, Str
         }),
     };
     Ok(content)
+}
+
+fn combine_dry_run_descriptor() -> serde_json::Value {
+    serde_json::json!({
+        "name": "combine_dry_run",
+        "description": "Non-destructive. Analyze two peer .rs files and return the proposed combine plan: new parent module directory, facade content with mod declarations and re-exports, path rewrites, and parent module updates.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "file1": { "type": "string", "description": "Path to first .rs file" },
+                "file2": { "type": "string", "description": "Path to second .rs file" },
+                "name": { "type": "string", "description": "Name for the new parent module. Defaults to stem of file1." },
+                "json": { "type": "boolean", "description": "Return structured JSON instead of human text." },
+                "preview_impacts": { "type": "boolean", "description": "Include consumer impact report (requires tokensave)." },
+                "use_tokensave": { "type": "boolean", "description": "Allow tokensave discovery. Defaults to true." },
+                "re_export_filter": { "type": "string", "description": "Regex filter for re-exports." },
+            },
+            "required": ["file1", "file2"],
+        },
+    })
+}
+
+fn combine_write_descriptor() -> serde_json::Value {
+    serde_json::json!({
+        "name": "combine_write",
+        "description": "DESTRUCTIVE: combine two peer .rs files into a new parent module. Backs up originals to .bak, creates facade, moves files, updates parent module declaration.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "file1": { "type": "string" },
+                "file2": { "type": "string" },
+                "name": { "type": "string" },
+                "force": { "type": "boolean", "description": "Overwrite existing target directory." },
+                "use_tokensave": { "type": "boolean" },
+                "re_export_filter": { "type": "string" },
+            },
+            "required": ["file1", "file2"],
+        },
+    })
+}
+
+fn tool_combine_dry_run(args: &serde_json::Value) -> Result<String, String> {
+    let file1 = require_string(args, "file1")?;
+    let file2 = require_string(args, "file2")?;
+    let name = args.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let json = args.get("json").and_then(|b| b.as_bool()).unwrap_or(false);
+    let preview_impacts = args.get("preview_impacts").and_then(|b| b.as_bool()).unwrap_or(false);
+    let use_tokensave = args.get("use_tokensave").and_then(|b| b.as_bool()).unwrap_or(true);
+    let re_export_filter = args.get("re_export_filter").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let opts = crate::combine::CombineOptions {
+        module_name: name,
+        write: false,
+        force: false,
+        json,
+        preview_impacts,
+        use_tokensave,
+        re_export_filter,
+    };
+    crate::combine::combine_dry_run(Path::new(file1), Path::new(file2), &opts)
+        .map_err(|e| format!("combine dry-run: {e}"))
+}
+
+fn tool_combine_write(args: &serde_json::Value) -> Result<String, String> {
+    let file1 = require_string(args, "file1")?;
+    let file2 = require_string(args, "file2")?;
+    let name = args.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let force = args.get("force").and_then(|b| b.as_bool()).unwrap_or(false);
+    let use_tokensave = args.get("use_tokensave").and_then(|b| b.as_bool()).unwrap_or(true);
+    let re_export_filter = args.get("re_export_filter").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let opts = crate::combine::CombineOptions {
+        module_name: name,
+        write: true,
+        force,
+        json: false,
+        preview_impacts: false,
+        use_tokensave,
+        re_export_filter,
+    };
+    let report = crate::combine::combine_write(Path::new(file1), Path::new(file2), &opts)
+        .map_err(|e| format!("combine write: {e}"))?;
+    serde_json::to_string_pretty(&report).map_err(|e| e.to_string())
 }
 
 fn consolidate_dry_run_descriptor() -> serde_json::Value {
