@@ -17,10 +17,11 @@ pub fn update_parent_module(
 
     // Remove old mod declarations
     file.items.retain(|item| {
-        if let syn::Item::Mod(m) = item {
-            if m.content.is_none() && old_modules.contains(&m.ident.to_string().as_str()) {
-                return false;
-            }
+        if let syn::Item::Mod(m) = item
+            && m.content.is_none()
+            && old_modules.contains(&m.ident.to_string().as_str())
+        {
+            return false;
         }
         true
     });

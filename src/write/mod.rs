@@ -128,13 +128,13 @@ impl SplitLayout {
     }
 
     fn includes_existing_module_file(&self, path: &Path) -> bool {
-        if !path.is_file() || !path.extension().is_some_and(|ext| ext == "rs") {
+        if !path.is_file() || path.extension().is_none_or(|ext| ext != "rs") {
             return false;
         }
-        if let Some(exclude) = &self.exclude_existing_file {
-            if same_path(path, exclude) {
-                return false;
-            }
+        if let Some(exclude) = &self.exclude_existing_file
+            && same_path(path, exclude)
+        {
+            return false;
         }
         true
     }

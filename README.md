@@ -85,8 +85,11 @@ the `tokensave` path-deps.
 
 ## CLI usage
 
-Three subcommands: `split` (the original), `consolidate` (the inverse),
-and `flatten` (an optional post-pass after consolidation).
+Eight subcommands: `split` (the original), `combine` (group peer files
+under a new parent module), `combine-suggest` (find good combine candidates),
+`consolidate` (the inverse of split), `flatten` (an optional post-pass after
+consolidation), `check` (local readiness diagnostics), `backups` (inspect
+`.bak` files), and `restore` (restore one backup).
 
 ### `split`
 
@@ -122,6 +125,60 @@ r2factor split — 20 items across 10 proposed file(s)
 
 The original is preserved at `fixtures/sample.rs.bak`. Re-running on the
 facade is refused (a sentinel comment in the generated facade is the guard).
+
+### `backups` / `restore`
+
+```
+r2factor backups [path] [--json]
+r2factor restore <file.rs.bak> [--force] [--json]
+```
+
+`backups` recursively lists `.bak` files and their restore targets, skipping
+`.git`, `.tokensave`, and `target`. `restore` copies one backup back to the
+sibling path without deleting the backup; it refuses to overwrite an existing
+target unless `--force` is provided.
+
+### `combine`
+
+```
+r2factor combine <file1.rs> <file2.rs> [more.rs ...] [--name <module>] [--write] [--force]
+```
+
+Combines two or more peer Rust files into a new parent module directory. Dry-run mode
+prints the generated facade, planned moves, parent-module update, and rewritten
+source previews for the moved files. Write mode creates backups, writes only the
+planned target files, preserves unrelated files in an existing target directory
+when `--force` is used, and rolls back from backups if the operation fails.
+
+| flag | what it does |
+|---|---|
+| `--json` | Return a structured dry-run report, including rewritten source previews, planned backups, and the write-mode manifest preview. |
+| `--preview-impacts` | Use TokenSave unresolved-reference data to report consumer path updates. |
+| `--preview-consumer-rewrites` | Dry-run the local source scanner used by `--rewrite-consumers` and include exact rewritten consumer source, line-level hunks, AST-backed import rewrites, and skipped safety candidates in JSON output. |
+| `--re-export-filter <regex>` | Re-export only matching public items from the generated facade. |
+| `--rewrite-consumers` | With `--write`, update consumer paths such as `crate::parser::parse` to `crate::front_end::parser::parse`, rewrite simple `use crate::{parser, lexer};` imports, and report skipped candidates that need review. |
+
+### `combine-suggest`
+
+```
+r2factor combine-suggest [path] [--json] [--min-score <n>]
+```
+
+Ranks sibling `.rs` files that are likely useful `combine` inputs. The scorer
+uses deterministic source references such as `crate::parser::parse`, adds a
+small boost for shared stem prefixes, and reports whether a TokenSave index is
+available for the inspected project.
+
+### `check`
+
+```
+r2factor check [path] [--json]
+```
+
+Reports the detected Cargo root, TokenSave index availability/statistics, local
+path dependencies, warnings such as a zero-edge TokenSave graph, and actionable
+suggestions with stable IDs. JSON output includes a `suggestions` array with
+optional commands, such as refreshing the TokenSave index.
 
 ### `consolidate`
 
@@ -196,10 +253,16 @@ MCP-aware tool can call it as a first-class action.
 ### What `r2factor mcp` is
 
 A JSON-RPC 2.0 stdio server. **You don't launch it manually** — your MCP
-client spawns it on demand. Six tools are exposed:
+client spawns it on demand. Twelve tools are exposed:
 
 - `split_dry_run` — analyze a file, return the proposed plan + cohesion.
-- `split_write` — actually perform the split (destructive; takes `force`).
+- `split_write` — actually perform the split and return a recursive write tree.
+- `combine_dry_run` — preview combining two or more peer files.
+- `combine_write` — perform combine, optionally rewriting consumers.
+- `combine_suggest` — suggest peer files that are good combine candidates.
+- `check` — report Cargo/TokenSave/local-path-dependency readiness.
+- `backups_list` — list `.bak` files and restore targets.
+- `backup_restore` — restore one `.bak` file, requiring `force` to overwrite.
 - `consolidate_dry_run` — inverse: return the merged source as text.
 - `consolidate_write` — inverse: replace the facade in place (destructive).
 - `flatten_dry_run` — flatten a consolidated file into one scope as text.
@@ -355,18 +418,23 @@ Destructive. Performs the split.
 | `file` | string | yes | — | Same as `split_dry_run`. |
 | `force` | bool | no | `false` | Overwrite an existing target directory and purge its top-level `.rs` files. Use with care. |
 | `use_tokensave` | bool | no | `true` | Same as `split_dry_run`. |
+| `llm` | bool | no | `false` | Run the LLM advisor before writing. |
+| `max_lines` | integer | no | `1000` | Recursively split generated files above this many lines; `0` disables recursion. |
 
 **Returns**
 
 ```json
 {
-  "backup": "fixtures/sample.rs.bak",
-  "target_dir": "fixtures/sample",
-  "written_files": [
-    "fixtures/sample/types.rs",
-    "fixtures/sample/eval.rs"
-  ],
-  "facade": "fixtures/sample.rs"
+  "report": {
+    "backup": "fixtures/sample.rs.bak",
+    "target_dir": "fixtures/sample",
+    "written_files": [
+      "fixtures/sample/types.rs",
+      "fixtures/sample/eval.rs"
+    ],
+    "facade": "fixtures/sample.rs"
+  },
+  "children": []
 }
 ```
 
@@ -476,7 +544,7 @@ Repo layout:
 
 ```
 src/
-  main.rs        — CLI entry point (clap subcommands: split, mcp)
+  main.rs        — CLI entry point
   lib.rs         — pub module wiring
   item.rs        — syn-based ParsedItem
   graph.rs       — RefVisitor (intra-file reference graph, incl. macro tokens)
@@ -487,6 +555,7 @@ src/
   plan/          — Plan, dry-run + cohesion reports
   write/         — facade + sub-file renderers, marker guard, backup
   mcp.rs         — JSON-RPC over stdio
+  health.rs      — readiness diagnostics
   llm.rs         — optional LLM advisor pass
   tokensave.rs   — optional tokensave cross-symbol evidence
   pipeline.rs    — run_split orchestrator

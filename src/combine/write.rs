@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use std::fs;
 use std::path::PathBuf;
 
+use super::impact::{ConsumerRewritePlan, ConsumerRewriteReport, SkippedConsumerRewrite};
 use super::parent::make_backup_path;
 
 #[derive(Debug, serde::Serialize)]
@@ -10,7 +11,10 @@ pub struct CombineWriteReport {
     pub facade_path: PathBuf,
     pub moved_files: Vec<MovedFile>,
     pub parent_update: Option<ParentUpdate>,
+    pub consumer_rewrites: Vec<ConsumerRewriteReport>,
+    pub skipped_consumer_rewrites: Vec<SkippedConsumerRewrite>,
     pub backups: Vec<PathBuf>,
+    pub manifest: OperationManifest,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -26,66 +30,199 @@ pub struct ParentUpdate {
     pub remove: Vec<String>,
 }
 
+#[derive(Debug, Default, serde::Serialize)]
+pub struct OperationManifest {
+    pub created_dirs: Vec<PathBuf>,
+    pub written_files: Vec<PathBuf>,
+    pub removed_files: Vec<PathBuf>,
+    pub updated_files: Vec<PathBuf>,
+    pub preserved_files: Vec<PathBuf>,
+}
+
 pub struct WriteOptions {
     pub force: bool,
 }
 
-/// Execute the combine write: create directory, write facade, move files,
-/// update parent module, create backups.
+#[derive(Clone)]
+struct BackupRecord {
+    path: PathBuf,
+    backup: PathBuf,
+    existed_before: bool,
+}
+
+#[derive(Default)]
+struct OperationState {
+    backups: Vec<BackupRecord>,
+    manifest: OperationManifest,
+}
+
+struct WritePayload<'a> {
+    facade_src: &'a str,
+    file_srcs: &'a [String],
+    parent_src: Option<&'a str>,
+    consumer_rewrite_plan: &'a ConsumerRewritePlan,
+}
+
+impl OperationState {
+    fn backup_path(&mut self, path: PathBuf) -> Result<PathBuf> {
+        let backup = make_backup_path(&path)?;
+        let existed_before = path.exists();
+        if existed_before {
+            fs::copy(&path, &backup)
+                .with_context(|| format!("backup {} -> {}", path.display(), backup.display()))?;
+        }
+        self.backups.push(BackupRecord {
+            path,
+            backup: backup.clone(),
+            existed_before,
+        });
+        Ok(backup)
+    }
+
+    fn write_file(&mut self, path: PathBuf, content: &str) -> Result<()> {
+        fs::write(&path, content).with_context(|| format!("write {}", path.display()))?;
+        self.manifest.written_files.push(path);
+        Ok(())
+    }
+
+    fn remove_file(&mut self, path: PathBuf) -> Result<()> {
+        fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
+        self.manifest.removed_files.push(path);
+        Ok(())
+    }
+
+    fn rollback(&self) {
+        for backup in self.backups.iter().rev() {
+            if backup.existed_before {
+                let _ = fs::copy(&backup.backup, &backup.path);
+            } else {
+                let _ = fs::remove_file(&backup.path);
+            }
+        }
+        for path in self.manifest.written_files.iter().rev() {
+            if !self
+                .backups
+                .iter()
+                .any(|b| b.path == *path && b.existed_before)
+            {
+                let _ = fs::remove_file(path);
+            }
+        }
+        for dir in self.manifest.created_dirs.iter().rev() {
+            let _ = fs::remove_dir(dir);
+        }
+    }
+
+    fn backup_paths(&self) -> Vec<PathBuf> {
+        self.backups
+            .iter()
+            .filter(|b| b.existed_before)
+            .map(|b| b.backup.clone())
+            .collect()
+    }
+
+    fn is_clean(&self) -> bool {
+        self.backups.is_empty()
+            && self.manifest.created_dirs.is_empty()
+            && self.manifest.written_files.is_empty()
+            && self.manifest.removed_files.is_empty()
+    }
+}
+
+/// Execute the combine write with conservative overwrite semantics. Force mode
+/// only overwrites the files this operation plans to write; unrelated files in
+/// the target directory are preserved.
 pub fn execute_write(
     plan: &super::plan::CombinePlan,
     facade_src: &str,
-    file1_src: &str,
-    file2_src: &str,
+    file_srcs: &[String],
     parent_src: Option<&str>,
+    consumer_rewrite_plan: &ConsumerRewritePlan,
     opts: &WriteOptions,
 ) -> Result<CombineWriteReport> {
-    // Check target dir
+    let mut op = OperationState::default();
+    let payload = WritePayload {
+        facade_src,
+        file_srcs,
+        parent_src,
+        consumer_rewrite_plan,
+    };
+    match execute_write_inner(plan, &payload, opts, &mut op) {
+        Ok(report) => Ok(report),
+        Err(e) => {
+            if op.is_clean() {
+                Err(e)
+            } else {
+                op.rollback();
+                Err(e.context("combine write failed; attempted rollback from backups"))
+            }
+        }
+    }
+}
+
+fn execute_write_inner(
+    plan: &super::plan::CombinePlan,
+    payload: &WritePayload<'_>,
+    opts: &WriteOptions,
+    op: &mut OperationState,
+) -> Result<CombineWriteReport> {
+    let file_dsts: Vec<PathBuf> = plan
+        .files
+        .iter()
+        .map(|file| {
+            file.file_name()
+                .map(|name| plan.target_dir.join(name))
+                .context("input file has no filename")
+        })
+        .collect::<Result<_>>()?;
+    let mut planned_targets = Vec::with_capacity(file_dsts.len() + 1);
+    planned_targets.push(plan.facade_path.clone());
+    planned_targets.extend(file_dsts.iter().cloned());
+
     if plan.target_dir.exists() && !opts.force {
         bail!(
             "target directory already exists: {}. Use --force to overwrite.",
             plan.target_dir.display()
         );
     }
-
-    // Create target dir
-    if plan.target_dir.exists() {
-        // With --force, remove existing .rs files in target dir
+    if !plan.target_dir.exists() {
+        fs::create_dir_all(&plan.target_dir)
+            .with_context(|| format!("mkdir {}", plan.target_dir.display()))?;
+        op.manifest.created_dirs.push(plan.target_dir.clone());
+    } else {
         for entry in fs::read_dir(&plan.target_dir)
             .with_context(|| format!("read_dir {}", plan.target_dir.display()))?
         {
             let entry = entry?;
             let path = entry.path();
-            if path.is_file() && path.extension().map_or(false, |e| e == "rs") {
-                fs::remove_file(&path)
-                    .with_context(|| format!("remove {}", path.display()))?;
+            if path.is_file() && !planned_targets.iter().any(|p| same_path(p, &path)) {
+                op.manifest.preserved_files.push(path);
             }
         }
-    } else {
-        fs::create_dir_all(&plan.target_dir)
-            .with_context(|| format!("mkdir {}", plan.target_dir.display()))?;
     }
 
     let mut backups = Vec::new();
+    for path in &planned_targets {
+        if path.exists() {
+            backups.push(op.backup_path(path.clone())?);
+        }
+    }
 
-    // Backup and write parent module
     let parent_update = if let Some(parent_path) = &plan.parent_module {
-        if let Some(parent_src) = parent_src {
-            let backup = make_backup_path(parent_path)?;
-            if parent_path.exists() {
-                fs::copy(parent_path, &backup)
-                    .with_context(|| format!("backup {}", parent_path.display()))?;
-                backups.push(backup);
-            }
-            fs::write(parent_path, parent_src)
-                .with_context(|| format!("write {}", parent_path.display()))?;
+        if let Some(parent_src) = payload.parent_src {
+            backups.push(op.backup_path(parent_path.clone())?);
+            op.write_file(parent_path.clone(), parent_src)?;
+            op.manifest.updated_files.push(parent_path.clone());
 
-            let stem1 = plan.file1.file_stem().unwrap().to_str().unwrap();
-            let stem2 = plan.file2.file_stem().unwrap().to_str().unwrap();
+            let stems = plan
+                .files
+                .iter()
+                .filter_map(|file| file.file_stem()?.to_str())
+                .collect::<Vec<_>>();
             Some(ParentUpdate {
                 path: parent_path.clone(),
                 add: format!("mod {};", plan.module_name),
-                remove: vec![format!("mod {};", stem1), format!("mod {};", stem2)],
+                remove: stems.iter().map(|stem| format!("mod {stem};")).collect(),
             })
         } else {
             None
@@ -94,48 +231,61 @@ pub fn execute_write(
         None
     };
 
-    // Write facade
-    fs::write(&plan.facade_path, facade_src)
-        .with_context(|| format!("write facade {}", plan.facade_path.display()))?;
+    op.write_file(plan.facade_path.clone(), payload.facade_src)?;
 
-    // Backup and move files
-    let mut moved_files = Vec::new();
+    for ((file, dst), src) in plan
+        .files
+        .iter()
+        .zip(file_dsts.iter())
+        .zip(payload.file_srcs.iter())
+    {
+        backups.push(op.backup_path(file.clone())?);
+        op.write_file(dst.clone(), src)?;
+        op.remove_file(file.clone())?;
+    }
 
-    let file1_name = plan.file1.file_name().unwrap();
-    let file1_dst = plan.target_dir.join(file1_name);
-    let backup1 = make_backup_path(&plan.file1)?;
-    fs::copy(&plan.file1, &backup1)
-        .with_context(|| format!("backup {}", plan.file1.display()))?;
-    backups.push(backup1);
-    fs::write(&file1_dst, file1_src)
-        .with_context(|| format!("write {}", file1_dst.display()))?;
-    fs::remove_file(&plan.file1)
-        .with_context(|| format!("remove {}", plan.file1.display()))?;
-    moved_files.push(MovedFile {
-        from: plan.file1.clone(),
-        to: file1_dst,
-    });
+    let mut consumer_reports = Vec::new();
+    for rewrite in &payload.consumer_rewrite_plan.rewrites {
+        let backup = op.backup_path(rewrite.file.clone())?;
+        op.write_file(rewrite.file.clone(), &rewrite.new_source)?;
+        op.manifest.updated_files.push(rewrite.file.clone());
+        consumer_reports.push(ConsumerRewriteReport {
+            file: rewrite.file.clone(),
+            replacements: rewrite.replacements,
+            hunks: rewrite.hunks.clone(),
+            backup,
+        });
+    }
 
-    let file2_name = plan.file2.file_name().unwrap();
-    let file2_dst = plan.target_dir.join(file2_name);
-    let backup2 = make_backup_path(&plan.file2)?;
-    fs::copy(&plan.file2, &backup2)
-        .with_context(|| format!("backup {}", plan.file2.display()))?;
-    backups.push(backup2);
-    fs::write(&file2_dst, file2_src)
-        .with_context(|| format!("write {}", file2_dst.display()))?;
-    fs::remove_file(&plan.file2)
-        .with_context(|| format!("remove {}", plan.file2.display()))?;
-    moved_files.push(MovedFile {
-        from: plan.file2.clone(),
-        to: file2_dst,
-    });
+    let moved_files = plan
+        .files
+        .iter()
+        .cloned()
+        .zip(file_dsts)
+        .map(|(from, to)| MovedFile { from, to })
+        .collect();
+
+    let manifest = std::mem::take(&mut op.manifest);
+    let mut all_backups = op.backup_paths();
+    all_backups.extend(backups);
+    all_backups.sort();
+    all_backups.dedup();
 
     Ok(CombineWriteReport {
         module_name: plan.module_name.clone(),
         facade_path: plan.facade_path.clone(),
         moved_files,
         parent_update,
-        backups,
+        consumer_rewrites: consumer_reports,
+        skipped_consumer_rewrites: payload.consumer_rewrite_plan.skipped.clone(),
+        backups: all_backups,
+        manifest,
     })
+}
+
+fn same_path(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
 }

@@ -1,26 +1,36 @@
 use quote::ToTokens;
 use syn::visit_mut::VisitMut;
 
-/// Rewrite paths inside a file that is moving one module level deeper.
-pub fn rewrite_paths(ast: &mut syn::File, other_file_stem: &str, new_module: &str) {
+pub fn rewrite_paths_many(ast: &mut syn::File, other_file_stems: &[&str], new_module: &str) {
     let mut rewriter = PathRewriter {
-        other_file_stem,
+        other_file_stems,
         new_module,
     };
     rewriter.visit_file_mut(ast);
 }
 
 struct PathRewriter<'a> {
-    other_file_stem: &'a str,
+    other_file_stems: &'a [&'a str],
     new_module: &'a str,
 }
 
 impl VisitMut for PathRewriter<'_> {
     fn visit_path_mut(&mut self, path: &mut syn::Path) {
         // Check conditions first, then mutate
-        let is_super = path.segments.first().map(|s| s.ident == "super").unwrap_or(false);
-        let is_crate_with_other = path.segments.first().map(|s| s.ident == "crate").unwrap_or(false)
-            && path.segments.get(1).map(|s| s.ident == self.other_file_stem).unwrap_or(false);
+        let is_super = path
+            .segments
+            .first()
+            .map(|s| s.ident == "super")
+            .unwrap_or(false);
+        let is_crate_with_other = path
+            .segments
+            .first()
+            .map(|s| s.ident == "crate")
+            .unwrap_or(false)
+            && path
+                .segments
+                .get(1)
+                .is_some_and(|s| self.other_file_stems.iter().any(|stem| s.ident == *stem));
 
         if is_super {
             let new_super = syn::PathSegment {

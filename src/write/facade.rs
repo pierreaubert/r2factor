@@ -8,6 +8,7 @@ use std::fmt::Write;
 /// attrs and the original `use`s, declares each generated sub-module, re-
 /// exports them, and inlines any "primary" items whose bucket name matches
 /// the file stem (these would otherwise round-trip through `<stem>/<stem>.rs`).
+#[allow(clippy::too_many_arguments)]
 pub fn render_facade(
     inner_attrs: &str,
     facade_uses: &[String],

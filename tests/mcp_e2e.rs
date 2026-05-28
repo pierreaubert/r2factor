@@ -60,6 +60,22 @@ impl Drop for McpSession {
     }
 }
 
+fn tool_payload(resp: &serde_json::Value) -> serde_json::Value {
+    serde_json::from_str(
+        resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text payload"),
+    )
+    .expect("tool payload envelope is JSON")
+}
+
+fn tool_data(resp: &serde_json::Value) -> serde_json::Value {
+    let payload = tool_payload(resp);
+    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["format"], "json");
+    payload["data"].clone()
+}
+
 #[test]
 fn initialize_returns_protocol_info() {
     let mut sess = McpSession::start();
@@ -90,6 +106,12 @@ fn tools_list_advertises_available_tools() {
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert!(names.contains(&"split_dry_run"));
     assert!(names.contains(&"split_write"));
+    assert!(names.contains(&"combine_dry_run"));
+    assert!(names.contains(&"combine_write"));
+    assert!(names.contains(&"combine_suggest"));
+    assert!(names.contains(&"check"));
+    assert!(names.contains(&"backups_list"));
+    assert!(names.contains(&"backup_restore"));
     assert!(names.contains(&"consolidate_dry_run"));
     assert!(names.contains(&"consolidate_write"));
     assert!(names.contains(&"flatten_dry_run"));
@@ -102,6 +124,94 @@ fn tools_list_advertises_available_tools() {
             t["name"]
         );
     }
+}
+
+#[test]
+fn backups_list_tool_returns_backup_json() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join("foo.rs.bak"), "old").unwrap();
+
+    let mut sess = McpSession::start();
+    let resp = sess.request(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "backups_list",
+            "arguments": {
+                "path": tmp.path(),
+            },
+        },
+    }));
+    let backups = tool_data(&resp);
+    let backups = backups.as_array().expect("backup array");
+    assert_eq!(backups.len(), 1);
+    assert!(
+        backups[0]["restore_target"]
+            .as_str()
+            .unwrap()
+            .ends_with("foo.rs")
+    );
+}
+
+#[test]
+fn backup_restore_tool_restores_with_force() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let target = tmp.path().join("foo.rs");
+    let backup = tmp.path().join("foo.rs.bak");
+    std::fs::write(&target, "new").unwrap();
+    std::fs::write(&backup, "old").unwrap();
+
+    let mut sess = McpSession::start();
+    let resp = sess.request(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "backup_restore",
+            "arguments": {
+                "backup": backup,
+                "force": true,
+            },
+        },
+    }));
+    assert!(resp["result"]["isError"].is_null());
+    let report = tool_data(&resp);
+    assert_eq!(report["replaced_existing"], true);
+    assert_eq!(std::fs::read_to_string(target).unwrap(), "old");
+}
+
+#[test]
+fn combine_suggest_tool_returns_ranked_json() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join("parser.rs"), "pub fn parse() {}\n").unwrap();
+    std::fs::write(
+        tmp.path().join("lexer.rs"),
+        "pub fn lex() { crate::parser::parse(); }\n",
+    )
+    .unwrap();
+
+    let mut sess = McpSession::start();
+    let resp = sess.request(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "combine_suggest",
+            "arguments": {
+                "path": tmp.path(),
+            },
+        },
+    }));
+    let report = tool_data(&resp);
+    assert_eq!(report["suggestions"].as_array().unwrap().len(), 1);
+    assert!(
+        report["suggestions"][0]["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason.as_str().unwrap().contains("references `parser`"))
+    );
 }
 
 #[test]
@@ -119,11 +229,8 @@ fn split_dry_run_returns_plan_and_cohesion() {
             },
         },
     }));
-    let content = &resp["result"]["content"][0];
-    assert_eq!(content["type"], "text");
-    let report: serde_json::Value =
-        serde_json::from_str(content["text"].as_str().expect("text payload"))
-            .expect("payload is JSON");
+    assert_eq!(resp["result"]["content"][0]["type"], "text");
+    let report = tool_data(&resp);
     assert!(report["plan"]["total_items"].as_u64().unwrap() > 0);
     assert!(!report["plan"]["buckets"].as_array().unwrap().is_empty());
     // Cohesion score is always present, even for a trivially-clustered
@@ -148,10 +255,10 @@ fn split_dry_run_reports_error_on_missing_file() {
     // `isError: true`, NOT as JSON-RPC errors. Verify that's what we do.
     assert!(resp["error"].is_null(), "should not be a JSON-RPC error");
     assert_eq!(resp["result"]["isError"], true);
-    let text = resp["result"]["content"][0]["text"]
-        .as_str()
-        .expect("error text");
-    assert!(text.contains("error"));
+    let payload = tool_payload(&resp);
+    assert_eq!(payload["ok"], false);
+    assert_eq!(payload["tool"], "split_dry_run");
+    assert!(payload["error"].as_str().unwrap().contains("read "));
 }
 
 #[test]

@@ -4,48 +4,49 @@ use std::path::{Path, PathBuf};
 /// Resolved plan for combining two peer files into a parent module.
 #[derive(Debug, Clone)]
 pub struct CombinePlan {
-    pub file1: PathBuf,
-    pub file2: PathBuf,
+    pub files: Vec<PathBuf>,
     pub module_name: String,
     pub target_dir: PathBuf,
     pub facade_path: PathBuf,
     pub parent_module: Option<PathBuf>,
 }
 
-/// Validate inputs and build a combine plan (dry-run or write).
-pub fn build_plan(file1: &Path, file2: &Path, module_name: Option<&str>) -> Result<CombinePlan> {
-    validate_file(file1)?;
-    validate_file(file2)?;
-
-    let parent1 = file1.parent().unwrap_or(Path::new("."));
-    let parent2 = file2.parent().unwrap_or(Path::new("."));
-    if parent1 != parent2 {
-        bail!(
-            "files must be in the same directory: {} vs {}",
-            file1.display(),
-            file2.display()
-        );
+pub fn build_plan_many(files: &[PathBuf], module_name: Option<&str>) -> Result<CombinePlan> {
+    if files.len() < 2 {
+        bail!("combine requires at least two .rs files");
+    }
+    for file in files {
+        validate_file(file)?;
     }
 
-    let name = module_name
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            file1
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("combined")
-                .to_string()
-        });
+    let parent = files[0].parent().unwrap_or(Path::new("."));
+    for file in &files[1..] {
+        let file_parent = file.parent().unwrap_or(Path::new("."));
+        if parent != file_parent {
+            bail!(
+                "files must be in the same directory: {} vs {}",
+                files[0].display(),
+                file.display()
+            );
+        }
+    }
 
-    let target_dir = parent1.join(&name);
+    let name = module_name.map(|s| s.to_string()).unwrap_or_else(|| {
+        files[0]
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("combined")
+            .to_string()
+    });
+
+    let target_dir = parent.join(&name);
     let facade_path = target_dir.join("mod.rs");
 
     // Discover parent module (lib.rs or nearest mod.rs)
-    let parent_module = discover_parent_module(parent1);
+    let parent_module = discover_parent_module(parent);
 
     Ok(CombinePlan {
-        file1: file1.to_path_buf(),
-        file2: file2.to_path_buf(),
+        files: files.to_vec(),
         module_name: name,
         target_dir,
         facade_path,
@@ -63,7 +64,10 @@ fn validate_file(path: &Path) -> Result<()> {
         bail!("not a .rs file: {}", path.display());
     }
     if name == "lib.rs" || name == "main.rs" {
-        bail!("cannot combine crate entry points (lib.rs / main.rs): {}", path.display());
+        bail!(
+            "cannot combine crate entry points (lib.rs / main.rs): {}",
+            path.display()
+        );
     }
     if !path.exists() {
         bail!("file does not exist: {}", path.display());

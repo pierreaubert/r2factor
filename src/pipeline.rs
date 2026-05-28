@@ -15,10 +15,26 @@ use std::path::{Path, PathBuf};
 const DEFAULT_RECURSIVE_MAX_LINES: usize = 1000;
 
 pub fn run_split(path: &Path, opts: SplitOptions) -> Result<()> {
-    run_split_inner(path, &opts, 0)
+    run_split_inner(path, &opts, 0, true).map(|_| ())
 }
 
-fn run_split_inner(path: &Path, opts: &SplitOptions, depth: usize) -> Result<()> {
+#[derive(Debug, serde::Serialize)]
+pub struct SplitWriteTree {
+    pub report: WriteReport,
+    pub children: Vec<SplitWriteTree>,
+}
+
+pub fn split_write_tree(path: &Path, opts: SplitOptions) -> Result<SplitWriteTree> {
+    run_split_inner(path, &opts, 0, false)?
+        .ok_or_else(|| anyhow::anyhow!("split_write_tree requires write options"))
+}
+
+fn run_split_inner(
+    path: &Path,
+    opts: &SplitOptions,
+    depth: usize,
+    emit: bool,
+) -> Result<Option<SplitWriteTree>> {
     let src = std::fs::read_to_string(path)?;
     // Refuse early — feeding an r2factor facade back through the pipeline
     // produces a degenerate plan that, if written, would delete the
@@ -44,41 +60,52 @@ fn run_split_inner(path: &Path, opts: &SplitOptions, depth: usize) -> Result<()>
         plan = run_llm(cfg, plan, &items);
     }
 
-    plan::print_dry_run(&plan, &items);
-    plan::report_cohesion(&plan, &items);
+    if emit {
+        plan::print_dry_run(&plan, &items);
+        plan::report_cohesion(&plan, &items);
+    }
 
     if let Some(write_opts) = opts.write {
         let report = write::write_plan(path, &plan, &items, &write_opts)?;
-        report_write(&report);
-        recursively_split_written(&report, opts, depth)?;
+        if emit {
+            report_write(&report);
+        }
+        let children = recursively_split_written(&report, opts, depth, emit)?;
+        return Ok(Some(SplitWriteTree { report, children }));
     }
 
-    Ok(())
+    Ok(None)
 }
 
 fn recursively_split_written(
     report: &WriteReport,
     opts: &SplitOptions,
     depth: usize,
-) -> Result<()> {
+    emit: bool,
+) -> Result<Vec<SplitWriteTree>> {
     let Some(write_opts) = opts.write else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let max_lines = write_opts
         .recursive_max_lines
         .unwrap_or(DEFAULT_RECURSIVE_MAX_LINES);
     if max_lines == 0 {
-        return Ok(());
+        return Ok(Vec::new());
     }
+    let mut children = Vec::new();
     for path in oversized_written_files(&report.written_files, max_lines)? {
-        eprintln!(
-            "[write] recursive split depth={} -> {} (>{max_lines} lines)",
-            depth + 1,
-            path.display()
-        );
-        run_split_inner(&path, opts, depth + 1)?;
+        if emit {
+            eprintln!(
+                "[write] recursive split depth={} -> {} (>{max_lines} lines)",
+                depth + 1,
+                path.display()
+            );
+        }
+        if let Some(child) = run_split_inner(&path, opts, depth + 1, emit)? {
+            children.push(child);
+        }
     }
-    Ok(())
+    Ok(children)
 }
 
 fn oversized_written_files(paths: &[PathBuf], max_lines: usize) -> Result<Vec<PathBuf>> {
@@ -103,7 +130,7 @@ fn load_evidence(path: &Path, items: &[ParsedItem]) -> Option<CrossFileEvidence>
             return None;
         }
     };
-    let ts = match Tokensave::open(&root) {
+    let ts = match Tokensave::open_safe(&root) {
         Ok(ts) => ts,
         Err(e) => {
             eprintln!("[tokensave] open failed: {e}");

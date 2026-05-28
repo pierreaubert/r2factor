@@ -7,6 +7,7 @@ mod matching;
 
 use crate::item::ParsedItem;
 use anyhow::{Context, Result};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use tokensave::db::Database;
 use tokio::runtime::{Builder, Runtime};
@@ -14,20 +15,32 @@ use tokio::runtime::{Builder, Runtime};
 pub use evidence::CrossFileEvidence;
 
 pub struct Tokensave {
-    pub(super) db: Database,
-    pub(super) project_root: PathBuf,
-    pub(super) rt: Runtime,
+    pub(crate) db: Database,
+    pub(crate) project_root: PathBuf,
+    pub(crate) rt: Runtime,
 }
 
 impl Tokensave {
     /// Walk up from `start` looking for `.tokensave/tokensave.db`. Returns
     /// the project root (parent of `.tokensave`).
     pub fn locate(start: &Path) -> Option<PathBuf> {
-        let mut cur = start
-            .canonicalize()
-            .ok()
-            .and_then(|p| p.parent().map(Path::to_path_buf))
-            .or_else(|| start.parent().map(Path::to_path_buf))?;
+        let canonical = start.canonicalize().ok();
+        let mut cur = canonical
+            .as_deref()
+            .and_then(|p| {
+                if p.is_dir() {
+                    Some(p.to_path_buf())
+                } else {
+                    p.parent().map(Path::to_path_buf)
+                }
+            })
+            .or_else(|| {
+                if start.is_dir() {
+                    Some(start.to_path_buf())
+                } else {
+                    start.parent().map(Path::to_path_buf)
+                }
+            })?;
         loop {
             if cur.join(".tokensave").join("tokensave.db").exists() {
                 return Some(cur);
@@ -52,6 +65,23 @@ impl Tokensave {
             project_root: project_root.to_path_buf(),
             rt,
         })
+    }
+
+    pub fn open_safe(project_root: &Path) -> Result<Self> {
+        let old_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        match catch_unwind(AssertUnwindSafe(|| Self::open(project_root))) {
+            Ok(result) => {
+                std::panic::set_hook(old_hook);
+                result
+            }
+            Err(_) => {
+                std::panic::set_hook(old_hook);
+                anyhow::bail!(
+                    "tokensave open panicked; the database schema may be newer than the linked tokensave crate"
+                )
+            }
+        }
     }
 
     pub fn evidence_for_file(

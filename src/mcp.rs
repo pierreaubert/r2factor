@@ -124,6 +124,10 @@ fn handle_tools_list() -> serde_json::Value {
             split_write_descriptor(),
             combine_dry_run_descriptor(),
             combine_write_descriptor(),
+            combine_suggest_descriptor(),
+            check_descriptor(),
+            backups_list_descriptor(),
+            backup_restore_descriptor(),
             consolidate_dry_run_descriptor(),
             consolidate_write_descriptor(),
             flatten_dry_run_descriptor(),
@@ -147,6 +151,10 @@ fn split_dry_run_descriptor() -> serde_json::Value {
                     "type": "boolean",
                     "description": "If true and a .tokensave/ database is found in an ancestor directory, fold in cross-symbol edges for better clustering. Defaults to true.",
                 },
+                "llm": { "type": "boolean", "description": "Run the optional LLM advisor pass before returning the plan." },
+                "llm_endpoint": { "type": "string", "description": "OpenAI-compatible chat completions endpoint." },
+                "llm_model": { "type": "string", "description": "LLM model name." },
+                "llm_api_key": { "type": "string", "description": "Bearer token for hosted endpoints." },
             },
             "required": ["file"],
         },
@@ -170,6 +178,10 @@ fn split_write_descriptor() -> serde_json::Value {
                     "type": "integer",
                     "description": "Recursively split generated files above this many lines. Defaults to 1000; use 0 to disable.",
                 },
+                "llm": { "type": "boolean", "description": "Run the optional LLM advisor pass before writing." },
+                "llm_endpoint": { "type": "string", "description": "OpenAI-compatible chat completions endpoint." },
+                "llm_model": { "type": "string", "description": "LLM model name." },
+                "llm_api_key": { "type": "string", "description": "Bearer token for hosted endpoints." },
             },
             "required": ["file"],
         },
@@ -191,6 +203,10 @@ fn handle_tools_call(params: serde_json::Value) -> Result<serde_json::Value, Str
         "split_write" => tool_split_write(&arguments),
         "combine_dry_run" => tool_combine_dry_run(&arguments),
         "combine_write" => tool_combine_write(&arguments),
+        "combine_suggest" => tool_combine_suggest(&arguments),
+        "check" => tool_check(&arguments),
+        "backups_list" => tool_backups_list(&arguments),
+        "backup_restore" => tool_backup_restore(&arguments),
         "consolidate_dry_run" => tool_consolidate_dry_run(&arguments),
         "consolidate_write" => tool_consolidate_write(&arguments),
         "flatten_dry_run" => tool_flatten_dry_run(&arguments),
@@ -202,32 +218,122 @@ fn handle_tools_call(params: serde_json::Value) -> Result<serde_json::Value, Str
     // do bubble up as JSON-RPC errors.
     let content = match outcome {
         Ok(text) => serde_json::json!({
-            "content": [{ "type": "text", "text": text }],
+            "content": [{ "type": "text", "text": tool_success_payload(name, &text) }],
         }),
         Err(e) => serde_json::json!({
-            "content": [{ "type": "text", "text": format!("error: {e}") }],
+            "content": [{ "type": "text", "text": tool_error_payload(name, &e) }],
             "isError": true,
         }),
     };
     Ok(content)
 }
 
+fn tool_success_payload(name: &str, text: &str) -> String {
+    let payload = match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(data) => serde_json::json!({
+            "ok": true,
+            "tool": name,
+            "format": "json",
+            "data": data,
+        }),
+        Err(_) => serde_json::json!({
+            "ok": true,
+            "tool": name,
+            "format": "text",
+            "text": text,
+        }),
+    };
+    serde_json::to_string_pretty(&payload).unwrap_or_else(|_| text.to_string())
+}
+
+fn tool_error_payload(name: &str, error: &str) -> String {
+    serde_json::to_string_pretty(&serde_json::json!({
+        "ok": false,
+        "tool": name,
+        "error": error,
+    }))
+    .unwrap_or_else(|_| format!("error: {error}"))
+}
+
+fn check_descriptor() -> serde_json::Value {
+    serde_json::json!({
+        "name": "check",
+        "description": "Inspect r2factor readiness for a project path: Cargo root, TokenSave index availability/statistics, local path dependencies, and warnings.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Path inside the project. Defaults to cwd." }
+            }
+        }
+    })
+}
+
+fn tool_check(args: &serde_json::Value) -> Result<String, String> {
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+    let report = crate::health::check(Path::new(path)).map_err(|e| format!("check {path}: {e}"))?;
+    serde_json::to_string_pretty(&report).map_err(|e| e.to_string())
+}
+
+fn backups_list_descriptor() -> serde_json::Value {
+    serde_json::json!({
+        "name": "backups_list",
+        "description": "List .bak files under a path and report their restore targets, size, and modified time. Non-destructive.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "File or directory to inspect. Defaults to cwd." }
+            }
+        }
+    })
+}
+
+fn backup_restore_descriptor() -> serde_json::Value {
+    serde_json::json!({
+        "name": "backup_restore",
+        "description": "DESTRUCTIVE: restore one .bak file to its original sibling path. Refuses to overwrite unless force is true.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "backup": { "type": "string", "description": "Backup file to restore, such as foo.rs.bak." },
+                "force": { "type": "boolean", "description": "Overwrite the restore target if it already exists. Defaults to false." }
+            },
+            "required": ["backup"]
+        }
+    })
+}
+
+fn tool_backups_list(args: &serde_json::Value) -> Result<String, String> {
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+    let backups = crate::backups::list_backups(Path::new(path))
+        .map_err(|e| format!("backups list {path}: {e}"))?;
+    serde_json::to_string_pretty(&backups).map_err(|e| e.to_string())
+}
+
+fn tool_backup_restore(args: &serde_json::Value) -> Result<String, String> {
+    let backup = require_string(args, "backup")?;
+    let force = args.get("force").and_then(|b| b.as_bool()).unwrap_or(false);
+    let report = crate::backups::restore_backup(Path::new(backup), force)
+        .map_err(|e| format!("backup restore {backup}: {e}"))?;
+    serde_json::to_string_pretty(&report).map_err(|e| e.to_string())
+}
+
 fn combine_dry_run_descriptor() -> serde_json::Value {
     serde_json::json!({
         "name": "combine_dry_run",
-        "description": "Non-destructive. Analyze two peer .rs files and return the proposed combine plan: new parent module directory, facade content with mod declarations and re-exports, path rewrites, and parent module updates.",
+        "description": "Non-destructive. Analyze two or more peer .rs files and return the proposed combine plan: new parent module directory, facade content with mod declarations and re-exports, path rewrites, and parent module updates.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "file1": { "type": "string", "description": "Path to first .rs file" },
                 "file2": { "type": "string", "description": "Path to second .rs file" },
+                "files": { "type": "array", "items": { "type": "string" }, "description": "Alternative input: all peer .rs files to combine. Must contain at least two files." },
                 "name": { "type": "string", "description": "Name for the new parent module. Defaults to stem of file1." },
                 "json": { "type": "boolean", "description": "Return structured JSON instead of human text." },
                 "preview_impacts": { "type": "boolean", "description": "Include consumer impact report (requires tokensave)." },
+                "preview_consumer_rewrites": { "type": "boolean", "description": "Include repo-wide consumer rewrite previews using the local source scanner." },
                 "use_tokensave": { "type": "boolean", "description": "Allow tokensave discovery. Defaults to true." },
                 "re_export_filter": { "type": "string", "description": "Regex filter for re-exports." },
             },
-            "required": ["file1", "file2"],
         },
     })
 }
@@ -235,30 +341,60 @@ fn combine_dry_run_descriptor() -> serde_json::Value {
 fn combine_write_descriptor() -> serde_json::Value {
     serde_json::json!({
         "name": "combine_write",
-        "description": "DESTRUCTIVE: combine two peer .rs files into a new parent module. Backs up originals to .bak, creates facade, moves files, updates parent module declaration.",
+        "description": "DESTRUCTIVE: combine two or more peer .rs files into a new parent module. Backs up originals to .bak, creates facade, moves files, updates parent module declaration.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "file1": { "type": "string" },
                 "file2": { "type": "string" },
+                "files": { "type": "array", "items": { "type": "string" } },
                 "name": { "type": "string" },
                 "force": { "type": "boolean", "description": "Overwrite existing target directory." },
                 "use_tokensave": { "type": "boolean" },
                 "re_export_filter": { "type": "string" },
+                "rewrite_consumers": { "type": "boolean", "description": "Rewrite crate consumers from old module paths to the new combined path." },
             },
-            "required": ["file1", "file2"],
+        },
+    })
+}
+
+fn combine_suggest_descriptor() -> serde_json::Value {
+    serde_json::json!({
+        "name": "combine_suggest",
+        "description": "Non-destructive. Suggest peer .rs files that are good candidates for combine, ranked by local source references and TokenSave readiness.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Directory, or a file inside the directory, to inspect. Defaults to cwd." },
+                "min_score": { "type": "integer", "description": "Minimum score required for a suggestion. Defaults to 1." }
+            },
         },
     })
 }
 
 fn tool_combine_dry_run(args: &serde_json::Value) -> Result<String, String> {
-    let file1 = require_string(args, "file1")?;
-    let file2 = require_string(args, "file2")?;
-    let name = args.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let files = combine_files(args)?;
+    let name = args
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let json = args.get("json").and_then(|b| b.as_bool()).unwrap_or(false);
-    let preview_impacts = args.get("preview_impacts").and_then(|b| b.as_bool()).unwrap_or(false);
-    let use_tokensave = args.get("use_tokensave").and_then(|b| b.as_bool()).unwrap_or(true);
-    let re_export_filter = args.get("re_export_filter").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let preview_impacts = args
+        .get("preview_impacts")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false);
+    let preview_consumer_rewrites = args
+        .get("preview_consumer_rewrites")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false);
+    let use_tokensave = args
+        .get("use_tokensave")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(true);
+    let re_export_filter = args
+        .get("re_export_filter")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let opts = crate::combine::CombineOptions {
         module_name: name,
         write: false,
@@ -267,18 +403,31 @@ fn tool_combine_dry_run(args: &serde_json::Value) -> Result<String, String> {
         preview_impacts,
         use_tokensave,
         re_export_filter,
+        rewrite_consumers: false,
+        preview_consumer_rewrites,
     };
-    crate::combine::combine_dry_run(Path::new(file1), Path::new(file2), &opts)
-        .map_err(|e| format!("combine dry-run: {e}"))
+    crate::combine::combine_dry_run_many(&files, &opts).map_err(|e| format!("combine dry-run: {e}"))
 }
 
 fn tool_combine_write(args: &serde_json::Value) -> Result<String, String> {
-    let file1 = require_string(args, "file1")?;
-    let file2 = require_string(args, "file2")?;
-    let name = args.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let files = combine_files(args)?;
+    let name = args
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let force = args.get("force").and_then(|b| b.as_bool()).unwrap_or(false);
-    let use_tokensave = args.get("use_tokensave").and_then(|b| b.as_bool()).unwrap_or(true);
-    let re_export_filter = args.get("re_export_filter").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let use_tokensave = args
+        .get("use_tokensave")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(true);
+    let re_export_filter = args
+        .get("re_export_filter")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let rewrite_consumers = args
+        .get("rewrite_consumers")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false);
     let opts = crate::combine::CombineOptions {
         module_name: name,
         write: true,
@@ -287,10 +436,47 @@ fn tool_combine_write(args: &serde_json::Value) -> Result<String, String> {
         preview_impacts: false,
         use_tokensave,
         re_export_filter,
+        rewrite_consumers,
+        preview_consumer_rewrites: false,
     };
-    let report = crate::combine::combine_write(Path::new(file1), Path::new(file2), &opts)
+    let report = crate::combine::combine_write_many(&files, &opts)
         .map_err(|e| format!("combine write: {e}"))?;
     serde_json::to_string_pretty(&report).map_err(|e| e.to_string())
+}
+
+fn tool_combine_suggest(args: &serde_json::Value) -> Result<String, String> {
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+    let min_score = args.get("min_score").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+    let report = crate::combine::suggest_groups(
+        Path::new(path),
+        &crate::combine::SuggestOptions { min_score },
+    )
+    .map_err(|e| format!("combine suggest {path}: {e}"))?;
+    serde_json::to_string_pretty(&report).map_err(|e| e.to_string())
+}
+
+fn combine_files(args: &serde_json::Value) -> Result<Vec<std::path::PathBuf>, String> {
+    if let Some(files) = args.get("files") {
+        let files = files
+            .as_array()
+            .ok_or_else(|| "files must be an array".to_string())?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(std::path::PathBuf::from)
+                    .ok_or_else(|| "files entries must be strings".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if files.len() < 2 {
+            return Err("files must contain at least two paths".to_string());
+        }
+        return Ok(files);
+    }
+
+    let file1 = require_string(args, "file1")?;
+    let file2 = require_string(args, "file2")?;
+    Ok(vec![file1.into(), file2.into()])
 }
 
 fn consolidate_dry_run_descriptor() -> serde_json::Value {
@@ -409,7 +595,13 @@ fn tool_split_dry_run(args: &serde_json::Value) -> Result<String, String> {
         None
     };
     crate::graph::annotate_refs(&mut items, evidence.as_ref());
-    let plan = crate::plan::build(&items);
+    let mut plan = crate::plan::build(&items);
+    if let Some(cfg) = llm_config_from_args(args) {
+        match crate::llm::advise(&cfg, &plan, &items) {
+            Ok(outcome) => plan = outcome.plan,
+            Err(e) => eprintln!("[r2factor-mcp] llm advisor failed: {e}"),
+        }
+    }
     let dry = crate::plan::dry_run_report(&plan, &items);
     let cohesion = crate::plan::cohesion_report(&plan, &items);
     let payload = serde_json::json!({
@@ -432,45 +624,42 @@ fn tool_split_write(args: &serde_json::Value) -> Result<String, String> {
         .map(|n| n as usize)
         .unwrap_or(1000);
 
-    let path = Path::new(file);
-    let src = std::fs::read_to_string(path).map_err(|e| format!("read {file}: {e}"))?;
-    if crate::write::is_r2factor_facade(&src) {
-        return Err(format!(
-            "{file} is already an r2factor facade — refusing to re-split"
-        ));
-    }
-    let mut items = crate::item::parse_file(&src).map_err(|e| format!("parse {file}: {e}"))?;
-    let evidence = if use_tokensave {
-        load_tokensave_evidence(path, &items)
-    } else {
-        None
-    };
-    crate::graph::annotate_refs(&mut items, evidence.as_ref());
-    let plan = crate::plan::build(&items);
     let opts = crate::write::WriteOptions {
         force,
         recursive_max_lines: Some(max_lines),
     };
-    let report =
-        crate::write::write_plan(path, &plan, &items, &opts).map_err(|e| format!("write: {e}"))?;
-    if max_lines > 0 {
-        for path in &report.written_files {
-            let src = std::fs::read_to_string(path)
-                .map_err(|e| format!("read generated {}: {e}", path.display()))?;
-            if src.lines().count() > max_lines {
-                crate::pipeline::run_split(
-                    path,
-                    crate::SplitOptions {
-                        use_tokensave,
-                        llm: None,
-                        write: Some(opts),
-                    },
-                )
-                .map_err(|e| format!("recursive split {}: {e}", path.display()))?;
-            }
-        }
+    let split_opts = crate::SplitOptions {
+        use_tokensave,
+        llm: llm_config_from_args(args),
+        write: Some(opts),
+    };
+    let tree = crate::pipeline::split_write_tree(Path::new(file), split_opts)
+        .map_err(|e| format!("write: {e}"))?;
+    serde_json::to_string_pretty(&tree).map_err(|e| e.to_string())
+}
+
+fn llm_config_from_args(args: &serde_json::Value) -> Option<crate::llm::LlmConfig> {
+    let enabled = args.get("llm").and_then(|b| b.as_bool()).unwrap_or(false);
+    if !enabled {
+        return None;
     }
-    serde_json::to_string_pretty(&report).map_err(|e| e.to_string())
+    Some(crate::llm::LlmConfig {
+        endpoint: args
+            .get("llm_endpoint")
+            .and_then(|v| v.as_str())
+            .unwrap_or("http://localhost:11434/v1/chat/completions")
+            .to_string(),
+        model: args
+            .get("llm_model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("llama3.2:3b")
+            .to_string(),
+        timeout_secs: 120,
+        api_key: args
+            .get("llm_api_key")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string),
+    })
 }
 
 /// Best-effort tokensave evidence load. Failures fall back to `None` —
@@ -482,7 +671,7 @@ fn load_tokensave_evidence(
 ) -> Option<crate::tokensave::CrossFileEvidence> {
     use crate::tokensave::Tokensave;
     let root = Tokensave::locate(path)?;
-    let ts = match Tokensave::open(&root) {
+    let ts = match Tokensave::open_safe(&root) {
         Ok(ts) => ts,
         Err(e) => {
             eprintln!("[r2factor-mcp] tokensave open failed: {e}");

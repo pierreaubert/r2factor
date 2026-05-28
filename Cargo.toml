@@ -16,6 +16,7 @@ tokensave-large-treesitters = { path = "/Users/pierre/src/tokensave/tokensave-la
 tokio = { version = "1", features = ["rt", "macros"] }
 regex = "1"
 ureq = { version = "2", features = ["json"] }
+libsql = "0.9.30"
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,9 +1,11 @@
+pub mod backups;
 pub mod carve;
 pub mod cluster;
 pub mod combine;
 pub mod consolidate;
 pub mod flatten;
 pub mod graph;
+pub mod health;
 pub mod item;
 pub mod llm;
 pub mod mcp;

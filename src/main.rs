@@ -15,11 +15,39 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// List `.bak` files created by r2factor operations.
+    Backups {
+        /// File or directory to inspect. Defaults to cwd.
+        path: Option<PathBuf>,
+        /// Output the backup list as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Check local r2factor readiness: Cargo root, TokenSave index health,
+    /// known weak signals, and local path dependencies.
+    Check {
+        /// Path inside the project to inspect. Defaults to cwd.
+        path: Option<PathBuf>,
+        /// Output the health report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Run r2factor as an MCP (Model Context Protocol) server over stdio.
     /// Lets an MCP-aware client (Claude Code, IDE extensions, etc.)
     /// discover and call `split_dry_run` and `split_write` as tools.
     Mcp,
-    /// Combine two peer `.rs` files into a new parent module directory.
+    /// Restore a single `.bak` file to its original sibling path.
+    Restore {
+        /// Backup file to restore, such as `foo.rs.bak`.
+        backup: PathBuf,
+        /// Overwrite the restore target if it already exists.
+        #[arg(long)]
+        force: bool,
+        /// Output the restore report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Combine two or more peer `.rs` files into a new parent module directory.
     /// Generates a facade with mod declarations and re-exports, rewrites
     /// paths, and updates the parent module declaration.
     Combine {
@@ -27,6 +55,8 @@ enum Cmd {
         file1: PathBuf,
         /// Second `.rs` file to combine.
         file2: PathBuf,
+        /// Additional peer `.rs` files to combine into the same parent module.
+        extra_files: Vec<PathBuf>,
         /// Name for the new parent module directory.
         #[arg(long)]
         name: Option<String>,
@@ -48,6 +78,23 @@ enum Cmd {
         /// Filter pattern for re-exports (regex).
         #[arg(long)]
         re_export_filter: Option<String>,
+        /// Rewrite crate consumers from old module paths to the new combined path.
+        #[arg(long, requires = "write")]
+        rewrite_consumers: bool,
+        /// Preview crate consumer path rewrites in dry-run output.
+        #[arg(long)]
+        preview_consumer_rewrites: bool,
+    },
+    /// Suggest peer files that are good candidates for `combine`.
+    CombineSuggest {
+        /// Directory (or a file inside the directory) to inspect. Defaults to cwd.
+        path: Option<PathBuf>,
+        /// Output suggestions as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Minimum score required for a suggestion.
+        #[arg(long, default_value_t = 1)]
+        min_score: usize,
     },
     /// Consolidate `foo.rs + foo/` (or `foo/mod.rs + foo/*.rs`) back into
     /// a single `.rs` file. Inverse of `split`. Without --write, just
@@ -107,7 +154,40 @@ enum Cmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
+        Cmd::Backups { path, json } => {
+            let path = path.unwrap_or(std::env::current_dir()?);
+            let entries = r2factor::backups::list_backups(&path)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&entries)?);
+            } else {
+                print!("{}", r2factor::backups::human_list(&entries));
+            }
+            Ok(())
+        }
+        Cmd::Check { path, json } => {
+            let path = path.unwrap_or(std::env::current_dir()?);
+            let report = r2factor::health::check(&path)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", r2factor::health::human_report(&report));
+            }
+            Ok(())
+        }
         Cmd::Mcp => r2factor::mcp::serve(),
+        Cmd::Restore {
+            backup,
+            force,
+            json,
+        } => {
+            let report = r2factor::backups::restore_backup(&backup, force)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", r2factor::backups::human_restore(&report));
+            }
+            Ok(())
+        }
         Cmd::Consolidate { path, write } => {
             if write {
                 let report = r2factor::consolidate::consolidate_write(
@@ -153,6 +233,7 @@ fn main() -> Result<()> {
         Cmd::Combine {
             file1,
             file2,
+            extra_files,
             name,
             write,
             force,
@@ -160,7 +241,11 @@ fn main() -> Result<()> {
             preview_impacts,
             no_tokensave,
             re_export_filter,
+            rewrite_consumers,
+            preview_consumer_rewrites,
         } => {
+            let mut files = vec![file1, file2];
+            files.extend(extra_files);
             let opts = CombineOptions {
                 module_name: name,
                 write,
@@ -169,25 +254,91 @@ fn main() -> Result<()> {
                 preview_impacts,
                 use_tokensave: !no_tokensave,
                 re_export_filter,
+                rewrite_consumers,
+                preview_consumer_rewrites,
             };
             if write {
-                let report = r2factor::combine::combine_write(&file1, &file2, &opts)?;
+                let report = r2factor::combine::combine_write_many(&files, &opts)?;
                 eprintln!("[combine] facade -> {}", report.facade_path.display());
                 for m in &report.moved_files {
                     eprintln!("[combine] moved {} -> {}", m.from.display(), m.to.display());
                 }
                 if let Some(p) = &report.parent_update {
-                    eprintln!("[combine] parent -> {} (add `{}`, remove {:?})", p.path.display(), p.add, p.remove);
+                    eprintln!(
+                        "[combine] parent -> {} (add `{}`, remove {:?})",
+                        p.path.display(),
+                        p.add,
+                        p.remove
+                    );
                 }
                 for b in &report.backups {
                     eprintln!("[combine] backup -> {}", b.display());
                 }
+                for r in &report.consumer_rewrites {
+                    eprintln!(
+                        "[combine] consumer -> {} ({} replacement(s))",
+                        r.file.display(),
+                        r.replacements
+                    );
+                    for hunk in &r.hunks {
+                        eprintln!("[combine]   L{}: {} -> {}", hunk.line, hunk.old, hunk.new);
+                    }
+                }
+                for skipped in &report.skipped_consumer_rewrites {
+                    eprintln!(
+                        "[combine] skipped consumer -> {}:{} `{}` ({})",
+                        skipped.file.display(),
+                        skipped.line,
+                        skipped.old,
+                        skipped.reason
+                    );
+                }
                 Ok(())
             } else {
-                let report = r2factor::combine::combine_dry_run(&file1, &file2, &opts)?;
+                let report = r2factor::combine::combine_dry_run_many(&files, &opts)?;
                 println!("{report}");
                 Ok(())
             }
+        }
+        Cmd::CombineSuggest {
+            path,
+            json,
+            min_score,
+        } => {
+            let path = path.unwrap_or(std::env::current_dir()?);
+            let report = r2factor::combine::suggest_groups(
+                &path,
+                &r2factor::combine::SuggestOptions { min_score },
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                if report.suggestions.is_empty() {
+                    println!(
+                        "No combine suggestions found in {}.",
+                        report.directory.display()
+                    );
+                } else {
+                    println!("Combine suggestions for {}:", report.directory.display());
+                    for suggestion in &report.suggestions {
+                        let files = suggestion
+                            .files
+                            .iter()
+                            .map(|path| path.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        println!(
+                            "- {} (score {}): {}",
+                            suggestion.module_name, suggestion.score, files
+                        );
+                        for reason in &suggestion.reasons {
+                            println!("  {reason}");
+                        }
+                    }
+                }
+                println!("[tokensave] {}", report.tokensave.message);
+            }
+            Ok(())
         }
         Cmd::Split {
             file,
