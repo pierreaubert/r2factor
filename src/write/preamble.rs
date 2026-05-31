@@ -28,18 +28,11 @@ pub fn extract_inner_attrs(src: &str) -> String {
     }
     // Slice up to (and including) the last line covered by an inner attr.
     // proc_macro2 spans are 1-indexed.
-    let end_line = inner
-        .iter()
-        .map(|a| a.span().end().line)
-        .max()
-        .unwrap_or(0);
+    let end_line = inner.iter().map(|a| a.span().end().line).max().unwrap_or(0);
     if end_line == 0 {
         return String::new();
     }
-    src.lines()
-        .take(end_line)
-        .collect::<Vec<_>>()
-        .join("\n")
+    src.lines().take(end_line).collect::<Vec<_>>().join("\n")
 }
 
 #[cfg(test)]

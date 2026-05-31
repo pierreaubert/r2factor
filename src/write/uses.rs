@@ -74,6 +74,50 @@ impl<'ast> Visit<'ast> for IdentCollector {
     fn visit_ident(&mut self, ident: &'ast proc_macro2::Ident) {
         self.found.insert(ident.to_string());
     }
+
+    fn visit_attribute(&mut self, attr: &'ast syn::Attribute) {
+        scan_attr_tokens(&attr.meta.to_token_stream(), self);
+    }
+
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        visit::visit_path(self, &mac.path);
+        scan_macro_tokens(&mac.tokens, self);
+    }
+}
+
+fn scan_macro_tokens(stream: &proc_macro2::TokenStream, v: &mut IdentCollector) {
+    use proc_macro2::TokenTree;
+    for tt in stream.clone() {
+        match tt {
+            TokenTree::Ident(id) => v.visit_ident(&id),
+            TokenTree::Group(g) => scan_macro_tokens(&g.stream(), v),
+            _ => {}
+        }
+    }
+}
+
+fn scan_attr_tokens(stream: &proc_macro2::TokenStream, v: &mut IdentCollector) {
+    use proc_macro2::TokenTree;
+    for tt in stream.clone() {
+        match tt {
+            TokenTree::Ident(id) => v.visit_ident(&id),
+            TokenTree::Group(g) => scan_attr_tokens(&g.stream(), v),
+            TokenTree::Literal(lit) => scan_attr_string_path_literal(&lit, v),
+            _ => {}
+        }
+    }
+}
+
+fn scan_attr_string_path_literal(lit: &proc_macro2::Literal, v: &mut IdentCollector) {
+    let Ok(lit) = syn::parse_str::<syn::LitStr>(&lit.to_string()) else {
+        return;
+    };
+    let Ok(path) = syn::parse_str::<syn::Path>(&lit.value()) else {
+        return;
+    };
+    for segment in path.segments {
+        v.found.insert(segment.ident.to_string());
+    }
 }
 
 /// Concatenate the source of every non-`use` item in `bucket_ids` and run
@@ -98,11 +142,22 @@ pub fn bucket_idents_for(
 /// Render only the bindings from `all_uses` that are actually referenced by
 /// `idents`. This also prunes inside grouped imports
 /// (`use foo::{A, B};` -> `use foo::A;` when only `A` is used).
+#[cfg(test)]
 pub fn render_uses_for(
     all_uses: &[&ParsedItem],
     idents: &HashSet<String>,
     known_names: &HashSet<String>,
     rebase: bool,
+) -> String {
+    render_uses_for_with_local_roots(all_uses, idents, known_names, rebase, &HashSet::new())
+}
+
+pub fn render_uses_for_with_local_roots(
+    all_uses: &[&ParsedItem],
+    idents: &HashSet<String>,
+    known_names: &HashSet<String>,
+    rebase: bool,
+    local_module_roots: &HashSet<String>,
 ) -> String {
     let mut provided = known_names.clone();
     for builtin in [
@@ -126,7 +181,7 @@ pub fn render_uses_for(
         .filter_map(|u| filter_use_for(u, idents, keep_globs))
         .map(|src| {
             if rebase {
-                rebase_use_for_subfile(&src)
+                rebase_use_for_subfile_with_local_roots(&src, local_module_roots)
             } else {
                 src
             }
@@ -166,9 +221,14 @@ fn filter_tree(tree: UseTree, idents: &HashSet<String>, keep_globs: bool) -> Opt
         UseTree::Name(n) => {
             binding_is_used(&n.ident.to_string(), idents).then_some(UseTree::Name(n))
         }
-        UseTree::Rename(r) => idents
-            .contains(&r.rename.to_string())
-            .then_some(UseTree::Rename(r)),
+        UseTree::Rename(r) => {
+            let used = if r.rename == "_" {
+                binding_is_used(&r.ident.to_string(), idents)
+            } else {
+                idents.contains(&r.rename.to_string())
+            };
+            used.then_some(UseTree::Rename(r))
+        }
         UseTree::Group(mut g) => {
             g.items = g
                 .items
@@ -196,6 +256,24 @@ fn trait_method_hint_is_used(binding: &str, idents: &HashSet<String>) -> bool {
     match binding {
         "AsGenericAudioBufferRef" => idents.contains("as_generic_audio_buffer_ref"),
         "AudioMut" => idents.contains("plane_mut") || idents.contains("plane_pair_mut"),
+        "DeviceTrait" => {
+            idents.contains("build_input_stream")
+                || idents.contains("build_output_stream")
+                || idents.contains("default_input_config")
+                || idents.contains("default_output_config")
+                || idents.contains("description")
+                || idents.contains("id")
+                || idents.contains("name")
+                || idents.contains("supported_input_configs")
+                || idents.contains("supported_output_configs")
+        }
+        "HostTrait" => {
+            idents.contains("default_input_device")
+                || idents.contains("default_output_device")
+                || idents.contains("devices")
+                || idents.contains("input_devices")
+                || idents.contains("output_devices")
+        }
         "MediaSource" => idents.contains("is_seekable"),
         "ReadBytes" => {
             idents.contains("pos")
@@ -206,6 +284,66 @@ fn trait_method_hint_is_used(binding: &str, idents: &HashSet<String>) -> bool {
                 || idents.contains("read_u32")
                 || idents.contains("read_quad_bytes")
         }
+        "Sample" => idents.contains("from_sample") || idents.contains("to_sample"),
+        "SerializeStruct" => {
+            idents.contains("serialize_field")
+                || idents.contains("skip_field")
+                || idents.contains("end")
+        }
+        "Engine" => {
+            idents.contains("encode")
+                || idents.contains("encode_string")
+                || idents.contains("decode")
+                || idents.contains("decode_vec")
+        }
+        "Rng" => {
+            idents.contains("random")
+                || idents.contains("random_range")
+                || idents.contains("random_bool")
+                || idents.contains("random_ratio")
+                || idents.contains("fill")
+        }
+        "SeedableRng" => {
+            idents.contains("seed_from_u64")
+                || idents.contains("from_rng")
+                || idents.contains("from_seed")
+                || idents.contains("from_os_rng")
+        }
+        "WriteBytesExt" => {
+            idents.contains("write_i8")
+                || idents.contains("write_i16")
+                || idents.contains("write_i32")
+                || idents.contains("write_i64")
+                || idents.contains("write_u8")
+                || idents.contains("write_u16")
+                || idents.contains("write_u32")
+                || idents.contains("write_u64")
+                || idents.contains("write_f32")
+                || idents.contains("write_f64")
+        }
+        "Zero" => {
+            idents.contains("zero") || idents.contains("is_zero") || idents.contains("set_zero")
+        }
+        "UnicodeSegmentation" => {
+            idents.contains("split_word_bound_indices")
+                || idents.contains("split_word_bounds")
+                || idents.contains("unicode_word_indices")
+                || idents.contains("unicode_words")
+                || idents.contains("grapheme_indices")
+                || idents.contains("graphemes")
+        }
+        "Resampler" => {
+            idents.contains("process")
+                || idents.contains("process_into_buffer")
+                || idents.contains("reset")
+                || idents.contains("input_frames_max")
+                || idents.contains("input_frames_next")
+                || idents.contains("output_frames_max")
+                || idents.contains("output_delay")
+                || idents.contains("nbr_channels")
+        }
+        "ThemeExt" => idents.contains("theme"),
+        "AccessibilityExt" => idents.contains("register_accessible"),
         "Seek" => idents.contains("seek"),
         _ => false,
     }
@@ -223,20 +361,30 @@ fn trait_method_hint_is_used(binding: &str, idents: &HashSet<String>) -> bool {
 /// put. The rewrite is byte-level so attribute formatting, trailing
 /// comments, and unusual whitespace survive verbatim.
 pub fn rebase_use_for_subfile(use_src: &str) -> String {
+    rebase_use_for_subfile_with_local_roots(use_src, &HashSet::new())
+}
+
+pub fn rebase_use_for_subfile_with_local_roots(
+    use_src: &str,
+    local_module_roots: &HashSet<String>,
+) -> String {
     let Ok(item) = syn::parse_str::<syn::ItemUse>(use_src) else {
         return use_src.to_string();
     };
-    let inner_tree = match &item.tree {
-        UseTree::Path(p) => p,
+    let root_ident = match &item.tree {
+        UseTree::Path(p) => &p.ident,
+        UseTree::Name(n) => &n.ident,
+        UseTree::Rename(r) => &r.ident,
         _ => return use_src.to_string(),
     };
-    let ident_str = inner_tree.ident.to_string();
+    let ident_str = root_ident.to_string();
     let action = match ident_str.as_str() {
         "super" => Action::WrapSuper,
         "self" => Action::ReplaceSelfWithSuper,
+        root if local_module_roots.contains(root) => Action::WrapSuper,
         _ => return use_src.to_string(),
     };
-    let span = inner_tree.ident.span();
+    let span = root_ident.span();
     let start = span.start();
     let Some(pos) = line_col_to_byte_offset(use_src, start.line, start.column) else {
         return use_src.to_string();
@@ -327,6 +475,15 @@ mod tests {
     }
 
     #[test]
+    fn rebase_local_module_root() {
+        let roots = HashSet::from(["filters".to_string()]);
+        assert_eq!(
+            rebase_use_for_subfile_with_local_roots("use filters::{XtcFilters};", &roots),
+            "use super::filters::{XtcFilters};"
+        );
+    }
+
+    #[test]
     fn rebase_pub_use_super() {
         // Visibility annotation comes before the `use` keyword; rebase
         // should still find `super` and wrap.
@@ -334,6 +491,250 @@ mod tests {
             rebase_use_for_subfile("pub use super::foo::Bar;"),
             "pub use super::super::foo::Bar;"
         );
+    }
+
+    #[test]
+    fn bucket_idents_include_derive_macro_names() {
+        let idents = bucket_idents(
+            "#[derive(Debug, Serialize, Deserialize)]\n#[serde(default)]\nstruct Session;\n",
+        )
+        .expect("source parses");
+        assert!(idents.contains("Serialize"), "idents={idents:?}");
+        assert!(idents.contains("Deserialize"), "idents={idents:?}");
+        assert!(idents.contains("serde"), "idents={idents:?}");
+    }
+
+    #[test]
+    fn bucket_idents_include_attribute_string_paths() {
+        let idents = bucket_idents(
+            "#[derive(Deserialize)]\nstruct Config {\n    #[serde(default = \"defaults::gain\")]\n    gain: f64,\n}\n",
+        )
+        .expect("source parses");
+        assert!(idents.contains("defaults"), "idents={idents:?}");
+        assert!(idents.contains("gain"), "idents={idents:?}");
+    }
+
+    #[test]
+    fn bucket_idents_include_macro_tokens() {
+        let idents = bucket_idents(
+            "fn uses_match(preset: Preset) { let _ = matches!(preset.crossover, SimpleCrossoverChoice::Lr48); }\n",
+        )
+        .expect("source parses");
+        assert!(idents.contains("matches"), "idents={idents:?}");
+        assert!(
+            idents.contains("SimpleCrossoverChoice"),
+            "idents={idents:?}"
+        );
+    }
+
+    #[test]
+    fn cpal_extension_trait_imports_survive_method_syntax() {
+        use crate::item::{ItemKind, ItemVis, ParsedItem};
+        use std::collections::HashSet;
+
+        let traits_source = "use cpal::traits::{DeviceTrait, HostTrait};".to_string();
+        let traits_use = ParsedItem {
+            id: 0,
+            kind: ItemKind::Use,
+            name: String::new(),
+            vis: ItemVis::Private,
+            is_cfg_test: false,
+            line_start: 1,
+            line_end: 1,
+            source: traits_source,
+            refs: Vec::new(),
+        };
+        let sample_use = ParsedItem {
+            id: 1,
+            kind: ItemKind::Use,
+            name: String::new(),
+            vis: ItemVis::Private,
+            is_cfg_test: false,
+            line_start: 2,
+            line_end: 2,
+            source: "use cpal::Sample;".to_string(),
+            refs: Vec::new(),
+        };
+        let idents = HashSet::from([
+            "default_output_device".to_string(),
+            "from_sample".to_string(),
+            "supported_output_configs".to_string(),
+        ]);
+
+        let rendered =
+            render_uses_for(&[&traits_use, &sample_use], &idents, &HashSet::new(), false);
+
+        assert!(rendered.contains("DeviceTrait"), "rendered={rendered}");
+        assert!(rendered.contains("HostTrait"), "rendered={rendered}");
+        assert!(rendered.contains("Sample"), "rendered={rendered}");
+    }
+
+    #[test]
+    fn serde_serialize_struct_trait_import_survives_method_syntax() {
+        use crate::item::{ItemKind, ItemVis, ParsedItem};
+        use std::collections::HashSet;
+
+        let serde_use = ParsedItem {
+            id: 0,
+            kind: ItemKind::Use,
+            name: String::new(),
+            vis: ItemVis::Private,
+            is_cfg_test: false,
+            line_start: 1,
+            line_end: 1,
+            source: "use serde::{ser::SerializeStruct, Serialize, Serializer};".to_string(),
+            refs: Vec::new(),
+        };
+        let idents = HashSet::from([
+            "Serialize".to_string(),
+            "Serializer".to_string(),
+            "serialize_struct".to_string(),
+            "serialize_field".to_string(),
+            "end".to_string(),
+        ]);
+
+        let rendered = render_uses_for(&[&serde_use], &idents, &HashSet::new(), false);
+
+        assert!(rendered.contains("SerializeStruct"), "rendered={rendered}");
+        assert!(rendered.contains("Serialize"), "rendered={rendered}");
+        assert!(rendered.contains("Serializer"), "rendered={rendered}");
+    }
+
+    #[test]
+    fn common_extension_trait_imports_survive_method_syntax() {
+        use crate::item::{ItemKind, ItemVis, ParsedItem};
+        use std::collections::HashSet;
+
+        let imports = [
+            ParsedItem {
+                id: 0,
+                kind: ItemKind::Use,
+                name: String::new(),
+                vis: ItemVis::Private,
+                is_cfg_test: false,
+                line_start: 1,
+                line_end: 1,
+                source: "use rustfft::num_traits::Zero;".to_string(),
+                refs: Vec::new(),
+            },
+            ParsedItem {
+                id: 1,
+                kind: ItemKind::Use,
+                name: String::new(),
+                vis: ItemVis::Private,
+                is_cfg_test: false,
+                line_start: 2,
+                line_end: 2,
+                source: "use byteorder::{BigEndian, WriteBytesExt};".to_string(),
+                refs: Vec::new(),
+            },
+            ParsedItem {
+                id: 2,
+                kind: ItemKind::Use,
+                name: String::new(),
+                vis: ItemVis::Private,
+                is_cfg_test: false,
+                line_start: 3,
+                line_end: 3,
+                source: "use rand::{Rng, SeedableRng};".to_string(),
+                refs: Vec::new(),
+            },
+            ParsedItem {
+                id: 3,
+                kind: ItemKind::Use,
+                name: String::new(),
+                vis: ItemVis::Private,
+                is_cfg_test: false,
+                line_start: 4,
+                line_end: 4,
+                source: "use base64::{Engine as _, engine::general_purpose};".to_string(),
+                refs: Vec::new(),
+            },
+            ParsedItem {
+                id: 4,
+                kind: ItemKind::Use,
+                name: String::new(),
+                vis: ItemVis::Private,
+                is_cfg_test: false,
+                line_start: 5,
+                line_end: 5,
+                source: "use unicode_segmentation::UnicodeSegmentation;".to_string(),
+                refs: Vec::new(),
+            },
+            ParsedItem {
+                id: 5,
+                kind: ItemKind::Use,
+                name: String::new(),
+                vis: ItemVis::Private,
+                is_cfg_test: false,
+                line_start: 6,
+                line_end: 6,
+                source: "use rubato::{Fft, FixedSync, Resampler};".to_string(),
+                refs: Vec::new(),
+            },
+            ParsedItem {
+                id: 6,
+                kind: ItemKind::Use,
+                name: String::new(),
+                vis: ItemVis::Private,
+                is_cfg_test: false,
+                line_start: 7,
+                line_end: 7,
+                source: "use crate::theme::ThemeExt;".to_string(),
+                refs: Vec::new(),
+            },
+            ParsedItem {
+                id: 7,
+                kind: ItemKind::Use,
+                name: String::new(),
+                vis: ItemVis::Private,
+                is_cfg_test: false,
+                line_start: 8,
+                line_end: 8,
+                source: "use crate::accessibility::AccessibilityExt;".to_string(),
+                refs: Vec::new(),
+            },
+        ];
+        let idents = HashSet::from([
+            "BigEndian".to_string(),
+            "Complex64".to_string(),
+            "Fft".to_string(),
+            "FixedSync".to_string(),
+            "StdRng".to_string(),
+            "encode".to_string(),
+            "from_rng".to_string(),
+            "general_purpose".to_string(),
+            "output_delay".to_string(),
+            "output_frames_max".to_string(),
+            "register_accessible".to_string(),
+            "random_range".to_string(),
+            "seed_from_u64".to_string(),
+            "split_word_bound_indices".to_string(),
+            "theme".to_string(),
+            "write_f32".to_string(),
+            "write_i32".to_string(),
+            "zero".to_string(),
+        ]);
+
+        let rendered = render_uses_for(
+            &imports.iter().collect::<Vec<_>>(),
+            &idents,
+            &HashSet::new(),
+            false,
+        );
+
+        assert!(rendered.contains("Zero"), "rendered={rendered}");
+        assert!(rendered.contains("WriteBytesExt"), "rendered={rendered}");
+        assert!(rendered.contains("Rng"), "rendered={rendered}");
+        assert!(rendered.contains("SeedableRng"), "rendered={rendered}");
+        assert!(rendered.contains("Engine as _"), "rendered={rendered}");
+        assert!(
+            rendered.contains("UnicodeSegmentation"),
+            "rendered={rendered}"
+        );
+        assert!(rendered.contains("Resampler"), "rendered={rendered}");
+        assert!(rendered.contains("ThemeExt"), "rendered={rendered}");
+        assert!(rendered.contains("AccessibilityExt"), "rendered={rendered}");
     }
 
     #[test]

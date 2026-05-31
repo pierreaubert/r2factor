@@ -29,11 +29,7 @@ pub fn pull_misc_by_calls(
 
     while pull_one_round(plan, &name_to_id, &by_id) {}
 
-    if plan
-        .assignments
-        .get("misc")
-        .is_some_and(|v| v.is_empty())
-    {
+    if plan.assignments.get("misc").is_some_and(|v| v.is_empty()) {
         plan.assignments.remove("misc");
     }
 }
@@ -47,11 +43,7 @@ fn pull_one_round(
     name_to_id: &BTreeMap<&str, ItemId>,
     by_id: &BTreeMap<ItemId, &ParsedItem>,
 ) -> bool {
-    let misc_ids: Vec<ItemId> = plan
-        .assignments
-        .get("misc")
-        .cloned()
-        .unwrap_or_default();
+    let misc_ids: Vec<ItemId> = plan.assignments.get("misc").cloned().unwrap_or_default();
     if misc_ids.is_empty() {
         return false;
     }
@@ -88,14 +80,9 @@ fn pull_one_round(
         if let Some(v) = plan.assignments.get_mut("misc") {
             v.retain(|x| *x != id);
         }
-        plan.assignments
-            .entry(dest.clone())
-            .or_default()
-            .push(id);
-        plan.rationale.insert(
-            id,
-            format!("call-graph: {weight} ref(s) into `{dest}`"),
-        );
+        plan.assignments.entry(dest.clone()).or_default().push(id);
+        plan.rationale
+            .insert(id, format!("call-graph: {weight} ref(s) into `{dest}`"));
         moved = true;
     }
     moved
@@ -153,10 +140,7 @@ mod tests {
     fn pull_leaves_unanchored_misc_alone() {
         // Two misc items that only ref each other never reach a real bucket,
         // so they stay in misc and the pass terminates.
-        let items = vec![
-            fake_fn(0, "a", vec!["b"]),
-            fake_fn(1, "b", vec!["a"]),
-        ];
+        let items = vec![fake_fn(0, "a", vec!["b"]), fake_fn(1, "b", vec!["a"])];
         let mut plan = Plan::default();
         plan.assign("misc", 0, "");
         plan.assign("misc", 1, "");

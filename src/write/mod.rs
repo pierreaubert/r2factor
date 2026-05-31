@@ -69,6 +69,7 @@ struct SplitLayout {
     facade_path_prefix: Option<String>,
     exclude_existing_file: Option<PathBuf>,
     remove_target_dir_if_empty: bool,
+    keep_main_in_facade: bool,
 }
 
 impl SplitLayout {
@@ -84,9 +85,14 @@ impl SplitLayout {
             .ok_or_else(|| anyhow!("invalid file stem in {}", original.display()))?;
 
         match file_name {
-            "main.rs" => bail!(
-                "splitting `main.rs` is not supported yet — split a regular module, `lib.rs`, or `mod.rs`"
-            ),
+            "main.rs" => Ok(Self {
+                primary_bucket: "main".to_string(),
+                target_dir: parent.join("main"),
+                facade_path_prefix: Some("main".to_string()),
+                exclude_existing_file: None,
+                remove_target_dir_if_empty: true,
+                keep_main_in_facade: true,
+            }),
             "lib.rs" => {
                 let isolated = is_isolated_lib_rs(parent, original);
                 Ok(Self {
@@ -103,6 +109,7 @@ impl SplitLayout {
                     },
                     exclude_existing_file: isolated.then(|| original.to_path_buf()),
                     remove_target_dir_if_empty: !isolated,
+                    keep_main_in_facade: false,
                 })
             }
             "mod.rs" => {
@@ -115,14 +122,17 @@ impl SplitLayout {
                     facade_path_prefix: None,
                     exclude_existing_file: Some(original.to_path_buf()),
                     remove_target_dir_if_empty: false,
+                    keep_main_in_facade: false,
                 })
             }
             _ => Ok(Self {
                 primary_bucket: stem.to_string(),
                 target_dir: parent.join(stem),
-                facade_path_prefix: None,
+                facade_path_prefix: is_cargo_crate_root_like(parent, file_name)
+                    .then(|| stem.to_string()),
                 exclude_existing_file: None,
                 remove_target_dir_if_empty: true,
+                keep_main_in_facade: is_binary_crate_root_like(parent, file_name),
             }),
         }
     }
@@ -138,6 +148,26 @@ impl SplitLayout {
         }
         true
     }
+}
+
+fn is_binary_crate_root_like(parent: &Path, file_name: &str) -> bool {
+    if file_name == "build.rs" {
+        return true;
+    }
+    matches!(
+        parent.file_name().and_then(|s| s.to_str()),
+        Some("bin" | "examples")
+    )
+}
+
+fn is_cargo_crate_root_like(parent: &Path, file_name: &str) -> bool {
+    if file_name == "build.rs" {
+        return true;
+    }
+    matches!(
+        parent.file_name().and_then(|s| s.to_str()),
+        Some("bin" | "examples" | "tests" | "benches" | "bench")
+    )
 }
 
 fn is_isolated_lib_rs(parent: &Path, original: &Path) -> bool {
@@ -167,6 +197,13 @@ pub fn write_plan(
 ) -> Result<WriteReport> {
     let layout = SplitLayout::for_path(original)?;
     let stem = layout.primary_bucket.as_str();
+    let adjusted_plan;
+    let plan = if layout.keep_main_in_facade {
+        adjusted_plan = force_main_into_facade_bucket(plan, items, stem);
+        &adjusted_plan
+    } else {
+        plan
+    };
 
     // Refuse to split our own output. The pipeline already bails for the
     // common case, but this is the last-line guard before we destroy
@@ -194,6 +231,8 @@ pub fn write_plan(
         .iter()
         .filter(|i| matches!(i.kind, ItemKind::Use))
         .collect();
+    let explicit_external_modules = external_mod_decls(plan, &by_id);
+    let macro_defined_names = macro_defined_names_from_mod_root(plan, &by_id);
     // Cross-bucket reference graph -> private items that need lifting,
     // plus the explicit imports each consumer needs so the bare-name refs
     // still resolve after the lift. All three derived from one shared
@@ -216,7 +255,7 @@ pub fn write_plan(
     // produce an E0255 ("name defined multiple times") at the `mod fmt;`
     // emission. Detect collisions against the names imported by
     // `mod_root` and append `_mod` to disambiguate.
-    let renames = compute_bucket_renames(plan, &all_uses, stem);
+    let renames = compute_bucket_renames(plan, &all_uses, stem, &explicit_external_modules);
     let assignments = rename_assignments(&plan.assignments, &renames);
     let cross_imports = rename_cross_imports(cross_imports, &renames);
     let facade_imports = rename_facade_imports(facade_imports, &renames);
@@ -243,6 +282,7 @@ pub fn write_plan(
                     None
                 }
             })
+            .filter(|module| !explicit_external_modules.contains(module))
             .collect()
     } else {
         BTreeSet::new()
@@ -299,6 +339,7 @@ pub fn write_plan(
                     None
                 }
             })
+            .filter(|module| !explicit_external_modules.contains(module))
             .collect()
     } else {
         BTreeSet::new()
@@ -310,7 +351,7 @@ pub fn write_plan(
     let mut written: Vec<PathBuf> = Vec::new();
     let mut sub_modules: Vec<String> = Vec::new();
     let mut reexport_modules: BTreeSet<String> = BTreeSet::new();
-    let mut facade_uses: Vec<String> = Vec::new();
+    let mut facade_root_items: Vec<String> = Vec::new();
     let mut facade_primary: Vec<&ParsedItem> = Vec::new();
 
     // Preserve existing sub-modules that are not part of the current plan.
@@ -320,11 +361,19 @@ pub fn write_plan(
             reexport_modules.insert(module.clone());
         }
     }
+    let local_module_roots: HashSet<String> = planned_files
+        .iter()
+        .chain(existing_modules.iter())
+        .chain(explicit_external_modules.iter())
+        .cloned()
+        .collect();
 
     for (module, ids) in &assignments {
         if module == "mod_root" {
             for id in ids {
-                facade_uses.push(by_id[id].source.clone());
+                if !matches!(by_id[id].kind, ItemKind::Use) {
+                    facade_root_items.push(by_id[id].source.clone());
+                }
             }
             continue;
         }
@@ -338,10 +387,19 @@ pub fn write_plan(
         let bucket_idents = uses::bucket_idents_for(ids, &by_id);
         let mut imports = cross_imports.get(module).cloned().unwrap_or_default();
         add_existing_module_imports(&mut imports, bucket_idents.as_ref(), &existing_modules);
+        add_macro_defined_imports(&mut imports, bucket_idents.as_ref(), &macro_defined_names);
         let known_names = bucket_known_names(ids, &by_id, &imports);
-        let bucket_prelude =
-            bucket_use_prelude_from_idents(bucket_idents.as_ref(), &all_uses, &known_names);
+        let bucket_prelude = bucket_use_prelude_from_idents(
+            bucket_idents.as_ref(),
+            &all_uses,
+            &known_names,
+            &local_module_roots,
+        );
+        let include_path_prefix = original
+            .parent()
+            .and_then(|parent| (!same_path(&target_dir, parent)).then_some("../"));
         let body = render_sub_file(
+            module,
             ids,
             &by_id,
             &bucket_prelude,
@@ -349,17 +407,17 @@ pub fn write_plan(
             &impl_lifts,
             &field_lifts,
             &imports,
+            include_path_prefix,
         );
         fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
         written.push(path);
-        if module_has_public_items(ids, &by_id) {
+        if module_has_reexportable_items(ids, &by_id) {
             reexport_modules.insert(module.clone());
         }
         sub_modules.push(module.clone());
     }
     sub_modules.sort();
-    let facade_primary_ids: Vec<ItemId> = facade_primary.iter().map(|it| it.id).collect();
-    facade_uses = facade_use_prelude(&facade_primary_ids, &by_id, &all_uses);
+    let facade_uses: Vec<String> = all_uses.iter().map(|u| u.source.clone()).collect();
 
     let kept_target_dir = if sub_modules.is_empty() && layout.remove_target_dir_if_empty {
         match fs::remove_dir(&target_dir) {
@@ -382,6 +440,7 @@ pub fn write_plan(
     let facade_body = render_facade(
         &inner_attrs,
         &facade_uses,
+        &facade_root_items,
         &facade_primary,
         &sub_modules,
         &reexport_modules,
@@ -421,6 +480,7 @@ fn bucket_use_prelude_from_idents(
     idents: Option<&HashSet<String>>,
     all_uses: &[&ParsedItem],
     known_names: &HashSet<String>,
+    local_module_roots: &HashSet<String>,
 ) -> String {
     let Some(idents) = idents else {
         return all_uses
@@ -429,7 +489,7 @@ fn bucket_use_prelude_from_idents(
             .collect::<Vec<_>>()
             .join("\n");
     };
-    uses::render_uses_for(all_uses, idents, known_names, true)
+    uses::render_uses_for_with_local_roots(all_uses, idents, known_names, true, local_module_roots)
 }
 
 fn add_existing_module_imports(
@@ -451,25 +511,23 @@ fn add_existing_module_imports(
     }
 }
 
-fn facade_use_prelude<'a>(
-    facade_ids: &[ItemId],
-    by_id: &BTreeMap<ItemId, &'a ParsedItem>,
-    all_uses: &'a [&'a ParsedItem],
-) -> Vec<String> {
-    let Some(idents) = uses::bucket_idents_for(facade_ids, by_id) else {
-        return all_uses.iter().map(|u| u.source.clone()).collect();
+fn add_macro_defined_imports(
+    imports: &mut BTreeSet<CrossImport>,
+    idents: Option<&HashSet<String>>,
+    macro_defined_names: &BTreeSet<String>,
+) {
+    let Some(idents) = idents else {
+        return;
     };
-    let known_names = facade_ids
-        .iter()
-        .filter_map(|id| {
-            let name = &by_id[id].name;
-            (!name.is_empty()).then(|| name.clone())
-        })
-        .collect();
-    uses::render_uses_for(all_uses, &idents, &known_names, false)
-        .lines()
-        .map(str::to_string)
-        .collect()
+    for name in macro_defined_names {
+        if idents.contains(name) {
+            imports.insert(CrossImport {
+                source_bucket: None,
+                name: name.clone(),
+                cfg_attrs: Vec::new(),
+            });
+        }
+    }
 }
 
 fn bucket_known_names(
@@ -490,9 +548,81 @@ fn bucket_known_names(
     names
 }
 
-fn module_has_public_items(ids: &[ItemId], by_id: &BTreeMap<ItemId, &ParsedItem>) -> bool {
+fn module_has_reexportable_items(ids: &[ItemId], by_id: &BTreeMap<ItemId, &ParsedItem>) -> bool {
     ids.iter()
-        .any(|id| by_id[id].vis == crate::item::ItemVis::Public)
+        .any(|id| by_id[id].vis != crate::item::ItemVis::Private)
+}
+
+fn external_mod_decls(plan: &Plan, by_id: &BTreeMap<ItemId, &ParsedItem>) -> BTreeSet<String> {
+    plan.assignments
+        .get("mod_root")
+        .into_iter()
+        .flat_map(|ids| ids.iter())
+        .filter_map(|id| {
+            let item = by_id[id];
+            item.is_external_mod_decl().then(|| item.name.clone())
+        })
+        .collect()
+}
+
+fn macro_defined_names_from_mod_root(
+    plan: &Plan,
+    by_id: &BTreeMap<ItemId, &ParsedItem>,
+) -> BTreeSet<String> {
+    plan.assignments
+        .get("mod_root")
+        .into_iter()
+        .flat_map(|ids| ids.iter())
+        .flat_map(|id| {
+            let item = by_id[id];
+            if matches!(item.kind, ItemKind::Macro) {
+                macro_defined_names(&item.source)
+            } else {
+                Vec::new()
+            }
+        })
+        .collect()
+}
+
+fn macro_defined_names(source: &str) -> Vec<String> {
+    let Ok(syn::Item::Macro(item)) = syn::parse_str::<syn::Item>(source) else {
+        return Vec::new();
+    };
+    let Some(last) = item.mac.path.segments.last() else {
+        return Vec::new();
+    };
+    if last.ident != "thread_local" {
+        return Vec::new();
+    }
+    thread_local_static_names(&item.mac.tokens)
+}
+
+fn thread_local_static_names(tokens: &proc_macro2::TokenStream) -> Vec<String> {
+    use proc_macro2::TokenTree;
+
+    let mut out = Vec::new();
+    let mut expect_name = false;
+    for token in tokens.clone() {
+        match token {
+            TokenTree::Ident(ident) if expect_name => {
+                out.push(ident.to_string());
+                expect_name = false;
+            }
+            TokenTree::Ident(ident) if ident == "static" => {
+                expect_name = true;
+            }
+            TokenTree::Group(group) => {
+                out.extend(thread_local_static_names(&group.stream()));
+                expect_name = false;
+            }
+            _ => {
+                if expect_name {
+                    expect_name = false;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Compute renames for sub-bucket names that collide with names already in
@@ -508,6 +638,7 @@ fn compute_bucket_renames(
     plan: &Plan,
     all_uses: &[&ParsedItem],
     stem: &str,
+    explicit_external_modules: &BTreeSet<String>,
 ) -> BTreeMap<String, String> {
     // Names brought into facade scope by `use` items that live in `mod_root`.
     // We don't worry about cross-bucket imports here — those are emitted
@@ -532,7 +663,7 @@ fn compute_bucket_renames(
         if bucket == "mod_root" || bucket == stem || bucket == "tests" {
             continue;
         }
-        if imported.contains(bucket) {
+        if imported.contains(bucket) || explicit_external_modules.contains(bucket) {
             renames.insert(bucket.clone(), format!("{bucket}_mod"));
         }
     }
@@ -555,6 +686,29 @@ fn rename_assignments(
         out.entry(key).or_default().extend(ids.iter().copied());
     }
     out
+}
+
+fn force_main_into_facade_bucket(plan: &Plan, items: &[ParsedItem], stem: &str) -> Plan {
+    let by_id: BTreeMap<ItemId, &ParsedItem> = items.iter().map(|it| (it.id, it)).collect();
+    let mut adjusted = Plan {
+        assignments: BTreeMap::new(),
+        rationale: plan.rationale.clone(),
+    };
+    for (module, ids) in &plan.assignments {
+        for id in ids {
+            let item = by_id[id];
+            if item.name == "main" && matches!(item.kind, ItemKind::Fn { .. }) {
+                adjusted.assign(stem, *id, "crate-root main stays in facade");
+            } else {
+                adjusted
+                    .assignments
+                    .entry(module.clone())
+                    .or_default()
+                    .push(*id);
+            }
+        }
+    }
+    adjusted
 }
 
 fn rename_cross_imports(

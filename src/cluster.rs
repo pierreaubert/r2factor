@@ -7,11 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// "anchors on". For impls and data types this is the type name itself; for
 /// free functions it's the first param type, then return type, then any
 /// known item name referenced. Items without any anchor go to `misc`.
-pub fn cluster_remaining(
-    items: &[ParsedItem],
-    plan: &mut Plan,
-    unassigned: &mut BTreeSet<ItemId>,
-) {
+pub fn cluster_remaining(items: &[ParsedItem], plan: &mut Plan, unassigned: &mut BTreeSet<ItemId>) {
     let by_id: BTreeMap<ItemId, &ParsedItem> = items.iter().map(|i| (i.id, i)).collect();
 
     let known_types: BTreeSet<String> = items
@@ -36,9 +32,11 @@ pub fn cluster_remaining(
 
     for id in unassigned.iter().copied() {
         let it = by_id[&id];
-        if matches!(it.kind, ItemKind::Use) {
-            // `use` lines are re-derived per-module after the move; leave
-            // them at the module root for now.
+        if matches!(it.kind, ItemKind::Use) || it.is_external_mod_decl() {
+            // `use` lines are re-derived per-module after the move; external
+            // `mod foo;` declarations already point at sibling files and must
+            // stay at the module root or rustc will look under the generated
+            // bucket directory instead.
             to_skip.push(id);
             continue;
         }
@@ -103,21 +101,12 @@ fn pick_anchor(
     prefix_winners: &BTreeSet<String>,
 ) -> (Option<String>, String) {
     match &it.kind {
-        ItemKind::Impl { self_ty, .. } => (
-            Some(self_ty.clone()),
-            format!("impl on `{self_ty}`"),
-        ),
+        ItemKind::Impl { self_ty, .. } => (Some(self_ty.clone()), format!("impl on `{self_ty}`")),
         ItemKind::Struct | ItemKind::Enum | ItemKind::Union => {
             (Some(it.name.clone()), format!("type `{}`", it.name))
         }
-        ItemKind::Trait => (
-            Some(it.name.clone()),
-            format!("trait `{}`", it.name),
-        ),
-        ItemKind::TypeAlias => (
-            Some(it.name.clone()),
-            format!("type alias `{}`", it.name),
-        ),
+        ItemKind::Trait => (Some(it.name.clone()), format!("trait `{}`", it.name)),
+        ItemKind::TypeAlias => (Some(it.name.clone()), format!("type alias `{}`", it.name)),
         ItemKind::Fn { .. } => {
             if let Some(p) = leading_prefix(&it.name)
                 && prefix_winners.contains(&p)
@@ -132,10 +121,7 @@ fn pick_anchor(
             }
             for r in &it.refs {
                 if known_types.contains(r) {
-                    return (
-                        Some(r.clone()),
-                        format!("fn references type `{r}`"),
-                    );
+                    return (Some(r.clone()), format!("fn references type `{r}`"));
                 }
             }
             (None, "no anchor type".to_string())
@@ -172,4 +158,3 @@ fn collapse_singletons(
     }
     out
 }
-

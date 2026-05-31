@@ -145,7 +145,7 @@ fn split_dry_run_descriptor() -> serde_json::Value {
             "properties": {
                 "file": {
                     "type": "string",
-                    "description": "Absolute or cwd-relative path to a .rs file. lib.rs and mod.rs are supported; main.rs is not yet supported.",
+                    "description": "Absolute or cwd-relative path to a .rs file. Supports regular modules, crate roots such as main.rs/lib.rs, and mod.rs.",
                 },
                 "use_tokensave": {
                     "type": "boolean",

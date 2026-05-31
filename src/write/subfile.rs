@@ -15,6 +15,7 @@ use std::fmt::Write;
 /// sub-buckets still resolve (since `pub use <bkt>::*;` only re-exports
 /// `pub` items, the wildcard chain doesn't reach `pub(super)` items).
 pub fn render_sub_file(
+    module: &str,
     ids: &[ItemId],
     by_id: &BTreeMap<ItemId, &ParsedItem>,
     use_prelude: &str,
@@ -22,6 +23,7 @@ pub fn render_sub_file(
     impl_lifts: &BTreeSet<ItemId>,
     field_lifts: &BTreeSet<ItemId>,
     imports: &BTreeSet<CrossImport>,
+    include_path_prefix: Option<&str>,
 ) -> String {
     let mut buf = String::new();
     buf.push_str(
@@ -56,6 +58,16 @@ pub fn render_sub_file(
         if matches!(it.kind, ItemKind::Use) {
             continue;
         }
+        if matches!(it.kind, ItemKind::Mod) && it.name == module {
+            let mut module_body =
+                unwrap_inline_module_source(&it.source).unwrap_or_else(|| it.source.clone());
+            if let Some(prefix) = include_path_prefix {
+                module_body = rebase_include_macro_paths(&module_body, prefix);
+            }
+            buf.push_str(&module_body);
+            buf.push_str("\n\n");
+            continue;
+        }
         // 1) Apply the relevant *visibility* transform (item-keyword level).
         let after_vis = if promote.contains(&id) {
             // `add_pub_super` handles both keyword AND fields, so skip the
@@ -83,9 +95,78 @@ pub fn render_sub_file(
         //    `super::foo()` in the body needs to become
         //    `super::super::foo()`. Visibility paths are skipped by the
         //    visitor so the steps above are not double-rewritten.
-        let final_src = rebase_body_super_for_subfile(&after_fields);
+        let mut final_src = rebase_body_super_for_subfile(&after_fields);
+        if let Some(prefix) = include_path_prefix {
+            final_src = rebase_include_macro_paths(&final_src, prefix);
+        }
         buf.push_str(&final_src);
         buf.push_str("\n\n");
     }
     buf
+}
+
+fn unwrap_inline_module_source(src: &str) -> Option<String> {
+    let file = syn::parse_file(src).ok()?;
+    let [syn::Item::Mod(module)] = file.items.as_slice() else {
+        return None;
+    };
+    module.content.as_ref()?;
+    let open = src.find('{')?;
+    let close = src.rfind('}')?;
+    if open >= close {
+        return None;
+    }
+    Some(src[open + 1..close].trim_matches('\n').to_string())
+}
+
+fn rebase_include_macro_paths(src: &str, prefix: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    loop {
+        let str_pos = rest.find("include_str!(\"");
+        let bytes_pos = rest.find("include_bytes!(\"");
+        let Some((pos, marker)) = (match (str_pos, bytes_pos) {
+            (Some(a), Some(b)) if a <= b => Some((a, "include_str!(\"")),
+            (Some(_), Some(b)) => Some((b, "include_bytes!(\"")),
+            (Some(a), None) => Some((a, "include_str!(\"")),
+            (None, Some(b)) => Some((b, "include_bytes!(\"")),
+            (None, None) => None,
+        }) else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..pos]);
+        out.push_str(marker);
+        let path_start = pos + marker.len();
+        let after_marker = &rest[path_start..];
+        let Some(path_end) = find_string_literal_end(after_marker) else {
+            out.push_str(after_marker);
+            break;
+        };
+        let path = &after_marker[..path_end];
+        if path.starts_with('/') {
+            out.push_str(path);
+        } else {
+            out.push_str(prefix);
+            out.push_str(path);
+        }
+        rest = &after_marker[path_end..];
+    }
+    out
+}
+
+fn find_string_literal_end(s: &str) -> Option<usize> {
+    let mut escaped = false;
+    for (idx, ch) in s.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '"' => return Some(idx),
+            _ => {}
+        }
+    }
+    None
 }

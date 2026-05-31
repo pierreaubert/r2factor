@@ -38,13 +38,14 @@ pub fn advise(cfg: &LlmConfig, plan: &Plan, items: &[ParsedItem]) -> Result<Advi
                 content: user_prompt,
             },
         ],
-        response_format: ResponseFormat { kind: "json_object" },
+        response_format: ResponseFormat {
+            kind: "json_object",
+        },
         temperature: 0.0,
         stream: false,
     };
 
     let raw = send_chat(cfg, &req)?;
-    let reply = parse_reply(&raw)
-        .with_context(|| format!("parse advisor JSON: {raw:.200}"))?;
+    let reply = parse_reply(&raw).with_context(|| format!("parse advisor JSON: {raw:.200}"))?;
     apply_reply(plan, items, reply)
 }

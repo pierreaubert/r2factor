@@ -12,6 +12,7 @@ use std::fmt::Write;
 pub fn render_facade(
     inner_attrs: &str,
     facade_uses: &[String],
+    facade_root_items: &[String],
     facade_primary: &[&ParsedItem],
     sub_modules: &[String],
     reexport_modules: &BTreeSet<String>,
@@ -36,6 +37,14 @@ pub fn render_facade(
         buf.push('\n');
     }
     if !facade_uses.is_empty() {
+        buf.push('\n');
+    }
+
+    for it in facade_root_items {
+        buf.push_str(it);
+        buf.push('\n');
+    }
+    if !facade_root_items.is_empty() {
         buf.push('\n');
     }
 

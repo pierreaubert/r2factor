@@ -7,7 +7,9 @@ pub type ItemId = usize;
 
 #[derive(Debug, Clone)]
 pub enum ItemKind {
-    Fn { is_test: bool },
+    Fn {
+        is_test: bool,
+    },
     Struct,
     Enum,
     Union,
@@ -80,6 +82,16 @@ impl ParsedItem {
             return t;
         }
         ""
+    }
+
+    pub fn is_external_mod_decl(&self) -> bool {
+        if !matches!(self.kind, ItemKind::Mod) {
+            return false;
+        }
+        matches!(
+            syn::parse_str::<syn::Item>(&self.source),
+            Ok(syn::Item::Mod(module)) if module.content.is_none()
+        )
     }
 }
 
@@ -163,10 +175,7 @@ fn item_kind_and_name(item: &Item) -> (ItemKind, String) {
         Item::ForeignMod(_) => (ItemKind::ForeignMod, String::new()),
         Item::Impl(i) => {
             let self_ty = type_to_anchor(&i.self_ty);
-            let trait_path = i
-                .trait_
-                .as_ref()
-                .map(|(_, path, _)| path_to_string(path));
+            let trait_path = i.trait_.as_ref().map(|(_, path, _)| path_to_string(path));
             let name = match &trait_path {
                 Some(t) => format!("impl {t} for {self_ty}"),
                 None => format!("impl {self_ty}"),
@@ -214,10 +223,7 @@ fn item_vis(item: &Item) -> ItemVis {
         Item::Union(i) => Some(&i.vis),
         Item::Use(i) => Some(&i.vis),
         Item::Mod(i) => Some(&i.vis),
-        Item::ForeignMod(_)
-        | Item::Impl(_)
-        | Item::Macro(_)
-        | Item::Verbatim(_) => None,
+        Item::ForeignMod(_) | Item::Impl(_) | Item::Macro(_) | Item::Verbatim(_) => None,
         other => panic!("unhandled syn::Item variant: {other:?}"),
     };
     match v {

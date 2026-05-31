@@ -74,18 +74,20 @@ fn is_facade_bucket(name: &str, stem: &str) -> bool {
 /// `pub` to keep the indices an implementation detail — callers outside
 /// the crate should go through the helper functions.
 pub struct RefContext<'a> {
-    pub(crate) name_to_id: BTreeMap<&'a str, ItemId>,
+    pub(crate) name_to_ids: BTreeMap<&'a str, Vec<ItemId>>,
     pub(crate) by_id: BTreeMap<ItemId, &'a ParsedItem>,
     pub(crate) bucket_of: BTreeMap<ItemId, &'a String>,
 }
 
 impl<'a> RefContext<'a> {
     pub fn new(plan: &'a Plan, items: &'a [ParsedItem]) -> Self {
-        let name_to_id = items
-            .iter()
-            .filter(|i| !i.name.is_empty())
-            .map(|i| (i.name.as_str(), i.id))
-            .collect();
+        let mut name_to_ids: BTreeMap<&str, Vec<ItemId>> = BTreeMap::new();
+        for it in items {
+            if it.name.is_empty() {
+                continue;
+            }
+            name_to_ids.entry(it.name.as_str()).or_default().push(it.id);
+        }
         let by_id = items.iter().map(|i| (i.id, i)).collect();
         let bucket_of = plan
             .assignments
@@ -93,7 +95,7 @@ impl<'a> RefContext<'a> {
             .flat_map(|(b, ids)| ids.iter().map(move |id| (*id, b)))
             .collect();
         Self {
-            name_to_id,
+            name_to_ids,
             by_id,
             bucket_of,
         }
@@ -117,30 +119,30 @@ pub fn compute_promotions(
             continue;
         };
         for r in &it.refs {
-            let Some(target_id) = ctx.name_to_id.get(r.as_str()) else {
+            let Some(target_ids) = ctx.name_to_ids.get(r.as_str()) else {
                 continue;
             };
-            let Some(target_bucket) = ctx.bucket_of.get(target_id) else {
-                continue;
-            };
-            if my_bucket == target_bucket {
-                continue;
-            }
-            if is_facade_bucket(target_bucket, stem) {
-                continue;
-            }
-            let target = ctx.by_id[target_id];
-            if target.vis == ItemVis::Private && needs_keyword_rewrite(target) {
-                out.insert(*target_id);
+            for target_id in target_ids {
+                let Some(target_bucket) = ctx.bucket_of.get(target_id) else {
+                    continue;
+                };
+                if my_bucket == target_bucket {
+                    continue;
+                }
+                if is_facade_bucket(target_bucket, stem) {
+                    continue;
+                }
+                let target = ctx.by_id[target_id];
+                if target.vis == ItemVis::Private && needs_keyword_rewrite(target) {
+                    out.insert(*target_id);
+                }
             }
         }
     }
     // cfg-variant siblings: `#[cfg(unix)] fn foo` and `#[cfg(not(unix))] fn foo`
-    // are two ParsedItems sharing one name. `ctx.name_to_id` is a BTreeMap so
-    // only one survives — meaning `compute_promotions` may have lifted only
-    // one variant. Rustc picks whichever cfg-active variant exists at build
-    // time, so a single-variant lift fails roughly half the time. Expand the
-    // set so every variant of every promoted name is lifted in lockstep.
+    // are two ParsedItems sharing one name. Keep every variant lifted in
+    // lockstep so rustc doesn't pick a cfg-active private variant at build
+    // time.
     let promoted_names: BTreeSet<&str> = out
         .iter()
         .filter_map(|id| ctx.by_id.get(id).map(|it| it.name.as_str()))
@@ -155,6 +157,41 @@ pub fn compute_promotions(
             // promote an item we wouldn't normally rewrite.
             if it.vis == ItemVis::Private && needs_keyword_rewrite(it) {
                 out.insert(it.id);
+            }
+        }
+    }
+    // A promoted item exposes its signature to sibling modules. If that
+    // signature mentions another private item, rustc rejects the sibling call
+    // even when the sibling never names the private type explicitly. Promote
+    // those referenced private items as well; `pub(super)` still keeps them
+    // scoped to the generated facade module.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let promoted: Vec<ItemId> = out.iter().copied().collect();
+        for id in promoted {
+            let Some(it) = ctx.by_id.get(&id) else {
+                continue;
+            };
+            for r in &it.refs {
+                let Some(target_ids) = ctx.name_to_ids.get(r.as_str()) else {
+                    continue;
+                };
+                for target_id in target_ids {
+                    let Some(target_bucket) = ctx.bucket_of.get(target_id) else {
+                        continue;
+                    };
+                    if is_facade_bucket(target_bucket, stem) || *target_bucket == "mod_root" {
+                        continue;
+                    }
+                    let target = ctx.by_id[target_id];
+                    if target.vis == ItemVis::Private
+                        && needs_keyword_rewrite(target)
+                        && out.insert(*target_id)
+                    {
+                        changed = true;
+                    }
+                }
             }
         }
     }
@@ -193,27 +230,32 @@ pub fn compute_cross_imports(
             continue;
         }
         for r in &it.refs {
-            let Some(target_id) = ctx.name_to_id.get(r.as_str()) else {
+            let Some(target_ids) = ctx.name_to_ids.get(r.as_str()) else {
                 continue;
             };
-            let Some(target_bucket) = ctx.bucket_of.get(target_id) else {
-                continue;
-            };
-            if my_bucket == target_bucket {
-                continue;
+            for target_id in target_ids {
+                let Some(target_bucket) = ctx.bucket_of.get(target_id) else {
+                    continue;
+                };
+                if my_bucket == target_bucket {
+                    continue;
+                }
+                if *target_bucket == "mod_root" {
+                    continue;
+                }
+                let target = ctx.by_id[target_id];
+                if !is_cross_importable(target) {
+                    continue;
+                }
+                out.entry((*my_bucket).clone())
+                    .or_default()
+                    .insert(CrossImport {
+                        source_bucket: (!is_facade_bucket(target_bucket, stem))
+                            .then(|| (*target_bucket).clone()),
+                        name: target.name.clone(),
+                        cfg_attrs: cfg_attrs_of(&target.source),
+                    });
             }
-            if *target_bucket == "mod_root" {
-                continue;
-            }
-            let target = ctx.by_id[target_id];
-            out.entry((*my_bucket).clone())
-                .or_default()
-                .insert(CrossImport {
-                    source_bucket: (!is_facade_bucket(target_bucket, stem))
-                        .then(|| (*target_bucket).clone()),
-                    name: target.name.clone(),
-                    cfg_attrs: cfg_attrs_of(&target.source),
-                });
         }
     }
     out
@@ -574,27 +616,36 @@ pub fn compute_facade_imports(
             continue;
         }
         for r in &it.refs {
-            let Some(target_id) = ctx.name_to_id.get(r.as_str()) else {
+            let Some(target_ids) = ctx.name_to_ids.get(r.as_str()) else {
                 continue;
             };
-            if !promote.contains(target_id) {
-                continue;
+            for target_id in target_ids {
+                if !promote.contains(target_id) {
+                    continue;
+                }
+                let Some(target_bucket) = ctx.bucket_of.get(target_id) else {
+                    continue;
+                };
+                if is_facade_bucket(target_bucket, stem) {
+                    continue;
+                }
+                let target = ctx.by_id[target_id];
+                if !is_cross_importable(target) {
+                    continue;
+                }
+                out.insert(CrossImport {
+                    source_bucket: Some((*target_bucket).clone()),
+                    name: target.name.clone(),
+                    cfg_attrs: cfg_attrs_of(&target.source),
+                });
             }
-            let Some(target_bucket) = ctx.bucket_of.get(target_id) else {
-                continue;
-            };
-            if is_facade_bucket(target_bucket, stem) {
-                continue;
-            }
-            let target = ctx.by_id[target_id];
-            out.insert(CrossImport {
-                source_bucket: Some((*target_bucket).clone()),
-                name: target.name.clone(),
-                cfg_attrs: cfg_attrs_of(&target.source),
-            });
         }
     }
     out
+}
+
+fn is_cross_importable(it: &ParsedItem) -> bool {
+    !matches!(&it.kind, crate::item::ItemKind::Impl { .. }) && !it.name.is_empty()
 }
 
 /// Items whose source starts with a visibility-friendly keyword we know how
@@ -953,6 +1004,56 @@ mod tests {
     }
 
     #[test]
+    fn cross_imports_include_every_cfg_variant() {
+        let mut unix = fake(
+            0,
+            "open_file",
+            ItemVis::Crate,
+            ItemKind::Fn { is_test: false },
+            &[],
+        );
+        unix.source = "#[cfg(unix)]\npub(crate) fn open_file() {}".to_string();
+        let mut windows = fake(
+            1,
+            "open_file",
+            ItemVis::Crate,
+            ItemKind::Fn { is_test: false },
+            &[],
+        );
+        windows.source = "#[cfg(windows)]\npub(crate) fn open_file() {}".to_string();
+        let caller = fake(
+            2,
+            "caller",
+            ItemVis::Public,
+            ItemKind::Fn { is_test: false },
+            &["open_file"],
+        );
+        let items = vec![unix, windows, caller];
+        let mut plan = Plan::default();
+        plan.assign("open", 0, "");
+        plan.assign("open", 1, "");
+        plan.assign("caller", 2, "");
+
+        let ctx = RefContext::new(&plan, &items);
+        let promote = compute_promotions(&ctx, &items, "file");
+        let cross = compute_cross_imports(&ctx, &items, &promote, "file");
+        let imports = cross.get("caller").expect("caller imports open_file");
+
+        assert!(
+            imports
+                .iter()
+                .any(|c| c.name == "open_file"
+                    && c.cfg_attrs.iter().any(|attr| attr.contains("unix"))),
+            "unix cfg import missing; imports={imports:?}"
+        );
+        assert!(
+            imports.iter().any(|c| c.name == "open_file"
+                && c.cfg_attrs.iter().any(|attr| attr.contains("windows"))),
+            "windows cfg import missing; imports={imports:?}"
+        );
+    }
+
+    #[test]
     fn cross_bucket_private_ref_triggers_promotion_and_import() {
         // File stem is `sample`. `parser` (sub-bucket) calls `helper`
         // (private fn in `eval` sub-bucket). Expect: helper is in the
@@ -990,6 +1091,43 @@ mod tests {
                     && c.name == "helper"
                     && c.cfg_attrs.is_empty()),
             "parser should import super::eval::helper with no cfg attrs"
+        );
+    }
+
+    #[test]
+    fn cross_imports_skip_impl_targets() {
+        let items = vec![
+            fake(0, "Widget", ItemVis::Public, ItemKind::Struct, &[]),
+            fake(
+                1,
+                "impl Widget",
+                ItemVis::Private,
+                ItemKind::Impl {
+                    self_ty: "Widget".to_string(),
+                    trait_path: None,
+                },
+                &[],
+            ),
+            fake(
+                2,
+                "make",
+                ItemVis::Public,
+                ItemKind::Fn { is_test: false },
+                &["impl Widget"],
+            ),
+        ];
+        let mut plan = Plan::default();
+        plan.assign("widget", 0, "");
+        plan.assign("widget", 1, "");
+        plan.assign("factory", 2, "");
+
+        let ctx = RefContext::new(&plan, &items);
+        let promote = compute_promotions(&ctx, &items, "sample");
+        let cross = compute_cross_imports(&ctx, &items, &promote, "sample");
+        let imports = cross.get("factory").cloned().unwrap_or_default();
+        assert!(
+            imports.iter().all(|c| c.name != "impl Widget"),
+            "impl blocks are not valid use targets; imports={imports:?}"
         );
     }
 

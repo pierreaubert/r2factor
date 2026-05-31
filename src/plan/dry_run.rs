@@ -50,11 +50,7 @@ pub fn dry_run_report(plan: &Plan, items: &[ParsedItem]) -> DryRunReport {
                         name: it.name.clone(),
                         line_start: it.line_start,
                         line_end: it.line_end,
-                        rationale: plan
-                            .rationale
-                            .get(id)
-                            .cloned()
-                            .unwrap_or_default(),
+                        rationale: plan.rationale.get(id).cloned().unwrap_or_default(),
                     }
                 })
                 .collect();
@@ -93,7 +89,11 @@ pub fn print_dry_run(plan: &Plan, items: &[ParsedItem]) {
             lines = bucket.line_count
         );
         for it in &bucket.items {
-            let name = if it.name.is_empty() { "<anon>" } else { &it.name };
+            let name = if it.name.is_empty() {
+                "<anon>"
+            } else {
+                &it.name
+            };
             println!(
                 "  L{:>4}-{:<4}  {:<6}  {:<32}  {}",
                 it.line_start, it.line_end, it.kind, name, it.rationale

@@ -9,10 +9,7 @@
 //! `foo.rs + foo/bar.rs` pair (general case) and a `foo/mod.rs`-style
 //! input.
 
-use r2factor::{
-    SplitOptions, consolidate, run_split,
-    write::WriteOptions,
-};
+use r2factor::{SplitOptions, consolidate, run_split, write::WriteOptions};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -68,15 +65,19 @@ fn round_trip_fixture_compiles() {
     let (tmp, facade) = split_in_tempdir("sample", &original);
 
     // After split, consolidate the result and write it back.
-    let report = consolidate::consolidate_write(
-        &facade,
-        &consolidate::ConsolidateOptions { write: true },
-    )
-    .expect("consolidate write");
+    let report =
+        consolidate::consolidate_write(&facade, &consolidate::ConsolidateOptions { write: true })
+            .expect("consolidate write");
 
     // Facade now holds the merged content. The sub-dir should be gone.
-    assert!(!tmp.path().join("sample").exists(), "sub-dir should be removed");
-    assert!(report.backup.is_some(), "facade should be backed up to .bak");
+    assert!(
+        !tmp.path().join("sample").exists(),
+        "sub-dir should be removed"
+    );
+    assert!(
+        report.backup.is_some(),
+        "facade should be backed up to .bak"
+    );
 
     // The merged file MUST compile cleanly under rustc.
     rustc_check(tmp.path(), "sample").expect("merged output must compile");
@@ -87,11 +88,8 @@ fn round_trip_idempotent_when_run_twice() {
     // First round-trip
     let original = fs::read_to_string("fixtures/sample.rs").expect("fixture");
     let (tmp, facade) = split_in_tempdir("sample", &original);
-    consolidate::consolidate_write(
-        &facade,
-        &consolidate::ConsolidateOptions { write: true },
-    )
-    .expect("first consolidate");
+    consolidate::consolidate_write(&facade, &consolidate::ConsolidateOptions { write: true })
+        .expect("first consolidate");
     let merged_once = fs::read_to_string(&facade).expect("read merged");
 
     // Re-split + re-consolidate — should produce equivalent content.
@@ -107,11 +105,8 @@ fn round_trip_idempotent_when_run_twice() {
         },
     )
     .expect("second split");
-    consolidate::consolidate_write(
-        &facade,
-        &consolidate::ConsolidateOptions { write: true },
-    )
-    .expect("second consolidate");
+    consolidate::consolidate_write(&facade, &consolidate::ConsolidateOptions { write: true })
+        .expect("second consolidate");
     let merged_twice = fs::read_to_string(&facade).expect("read merged twice");
 
     // Byte-equal would be aggressive — we accept compiled equivalence
@@ -141,11 +136,8 @@ fn consolidate_hand_written_module_compiles() {
     )
     .unwrap();
 
-    consolidate::consolidate_write(
-        &foo,
-        &consolidate::ConsolidateOptions { write: true },
-    )
-    .expect("consolidate hand-written");
+    consolidate::consolidate_write(&foo, &consolidate::ConsolidateOptions { write: true })
+        .expect("consolidate hand-written");
 
     assert!(!foo_dir.exists(), "foo/ should be removed");
     rustc_check(tmp.path(), "foo").expect("hand-written merged must compile");

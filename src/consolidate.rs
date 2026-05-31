@@ -132,9 +132,8 @@ pub fn consolidate_write(
     // be inside the doomed sub-dir anyway, but the merge target lives
     // elsewhere so we delete it explicitly here too).
     if layout.facade != layout.merged_target && layout.facade.exists() {
-        fs::remove_file(&layout.facade).with_context(|| {
-            format!("remove old facade {}", layout.facade.display())
-        })?;
+        fs::remove_file(&layout.facade)
+            .with_context(|| format!("remove old facade {}", layout.facade.display()))?;
     }
 
     let removed_files = prune_consumed_rs(&layout)?;
@@ -152,8 +151,8 @@ pub fn consolidate_write(
 // ---------------------------------------------------------------------------
 
 fn discover_layout(input_path: &Path) -> Result<Layout> {
-    let meta = fs::metadata(input_path)
-        .with_context(|| format!("stat {}", input_path.display()))?;
+    let meta =
+        fs::metadata(input_path).with_context(|| format!("stat {}", input_path.display()))?;
     let (facade, sub_dir, merged_target) = if meta.is_file() {
         resolve_from_file(input_path)?
     } else if meta.is_dir() {
@@ -218,9 +217,9 @@ fn resolve_from_file(path: &Path) -> Result<(PathBuf, PathBuf, PathBuf)> {
 fn resolve_from_dir(path: &Path) -> Result<(PathBuf, PathBuf, PathBuf)> {
     let mod_rs = path.join("mod.rs");
     if mod_rs.is_file() {
-        let parent_of_foo = path.parent().ok_or_else(|| {
-            anyhow!("module dir has no parent (consolidating a crate root?)")
-        })?;
+        let parent_of_foo = path
+            .parent()
+            .ok_or_else(|| anyhow!("module dir has no parent (consolidating a crate root?)"))?;
         let foo_name = path
             .file_name()
             .and_then(|s| s.to_str())
@@ -249,9 +248,7 @@ fn resolve_from_dir(path: &Path) -> Result<(PathBuf, PathBuf, PathBuf)> {
 
 fn collect_bucket_names(sub_dir: &Path) -> Result<BTreeSet<String>> {
     let mut names = BTreeSet::new();
-    for entry in fs::read_dir(sub_dir)
-        .with_context(|| format!("read_dir {}", sub_dir.display()))?
-    {
+    for entry in fs::read_dir(sub_dir).with_context(|| format!("read_dir {}", sub_dir.display()))? {
         let entry = entry?;
         let path = entry.path();
         if !path.is_file() {
@@ -327,9 +324,7 @@ fn merge_layout(layout: &Layout) -> Result<String> {
     // Any sub-files left over (no matching `mod <name>;` in the facade)
     // get appended as their own inline mods so they're not silently lost.
     for (name, block) in inline_blocks {
-        eprintln!(
-            "[consolidate] note: {name}.rs has no `mod {name};` in facade — appending"
-        );
+        eprintln!("[consolidate] note: {name}.rs has no `mod {name};` in facade — appending");
         out.push_str(&block);
         out.push_str("\n\n");
     }
@@ -384,14 +379,19 @@ fn strip_autogen_banner(src: &str) -> String {
 /// block so `#[cfg(test)] mod tests;` becomes `#[cfg(test)] mod tests { ... }`.
 fn mod_attr_and_vis_prefix(src: &str, m: &syn::ItemMod) -> String {
     use syn::spanned::Spanned;
-    let item_start = m.attrs.iter().map(|a| a.span().start()).min().unwrap_or_else(|| {
-        // No attrs — start at the vis span (or mod_token if vis is inherited).
-        match &m.vis {
-            syn::Visibility::Public(t) => t.span.start(),
-            syn::Visibility::Restricted(r) => r.pub_token.span.start(),
-            syn::Visibility::Inherited => m.mod_token.span.start(),
-        }
-    });
+    let item_start = m
+        .attrs
+        .iter()
+        .map(|a| a.span().start())
+        .min()
+        .unwrap_or_else(|| {
+            // No attrs — start at the vis span (or mod_token if vis is inherited).
+            match &m.vis {
+                syn::Visibility::Public(t) => t.span.start(),
+                syn::Visibility::Restricted(r) => r.pub_token.span.start(),
+                syn::Visibility::Inherited => m.mod_token.span.start(),
+            }
+        });
     let mod_start = m.mod_token.span.start();
     let Some(s) = line_col_to_byte_offset(src, item_start.line, item_start.column) else {
         return String::new();
@@ -427,15 +427,8 @@ fn facade_inner_attrs_source(src: &str, file: &syn::File) -> String {
     if inner.is_empty() {
         return String::new();
     }
-    let end_line = inner
-        .iter()
-        .map(|a| a.span().end().line)
-        .max()
-        .unwrap_or(0);
-    src.lines()
-        .take(end_line)
-        .collect::<Vec<_>>()
-        .join("\n")
+    let end_line = inner.iter().map(|a| a.span().end().line).max().unwrap_or(0);
+    src.lines().take(end_line).collect::<Vec<_>>().join("\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -471,8 +464,7 @@ fn prune_consumed_rs(layout: &Layout) -> Result<Vec<PathBuf>> {
             false
         };
         if is_consumed_rs {
-            fs::remove_file(&path)
-                .with_context(|| format!("remove {}", path.display()))?;
+            fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
             removed.push(path);
         }
     }

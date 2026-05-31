@@ -18,8 +18,8 @@ const RESERVED: &[&str] = &[
     "as", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern", "false", "fn",
     "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref",
     "return", "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe",
-    "use", "where", "while", "async", "await", "abstract", "become", "box", "do", "final",
-    "macro", "override", "priv", "typeof", "unsized", "virtual", "yield", "try", "gen",
+    "use", "where", "while", "async", "await", "abstract", "become", "box", "do", "final", "macro",
+    "override", "priv", "typeof", "unsized", "virtual", "yield", "try", "gen",
 ];
 
 /// If `name` would collide with a Rust keyword, append `_` to make it a

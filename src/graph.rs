@@ -1,5 +1,6 @@
 use crate::item::{ItemId, ParsedItem};
 use crate::tokensave::CrossFileEvidence;
+use quote::ToTokens;
 use std::collections::{BTreeMap, HashSet};
 use syn::visit::{self, Visit};
 
@@ -68,10 +69,11 @@ struct RefVisitor<'a> {
 
 impl<'ast, 'a> Visit<'ast> for RefVisitor<'a> {
     fn visit_ident(&mut self, ident: &'ast proc_macro2::Ident) {
-        let s = ident.to_string();
-        if s != self.self_name && self.names.contains(&s) {
-            self.found.insert(s);
-        }
+        self.record_ident(&ident.to_string());
+    }
+
+    fn visit_attribute(&mut self, attr: &'ast syn::Attribute) {
+        scan_attr_tokens(&attr.meta.to_token_stream(), self);
     }
 
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
@@ -81,6 +83,38 @@ impl<'ast, 'a> Visit<'ast> for RefVisitor<'a> {
         // scan so refs from inside macro calls aren't lost.
         visit::visit_path(self, &mac.path);
         scan_token_stream(&mac.tokens, self);
+    }
+}
+
+impl RefVisitor<'_> {
+    fn record_ident(&mut self, ident: &str) {
+        if ident != self.self_name && self.names.contains(ident) {
+            self.found.insert(ident.to_string());
+        }
+    }
+}
+
+fn scan_attr_tokens(stream: &proc_macro2::TokenStream, v: &mut RefVisitor) {
+    use proc_macro2::TokenTree;
+    for tt in stream.clone() {
+        match tt {
+            TokenTree::Ident(id) => v.record_ident(&id.to_string()),
+            TokenTree::Group(g) => scan_attr_tokens(&g.stream(), v),
+            TokenTree::Literal(lit) => scan_attr_string_path_literal(&lit, v),
+            _ => {}
+        }
+    }
+}
+
+fn scan_attr_string_path_literal(lit: &proc_macro2::Literal, v: &mut RefVisitor) {
+    let Ok(lit) = syn::parse_str::<syn::LitStr>(&lit.to_string()) else {
+        return;
+    };
+    let Ok(path) = syn::parse_str::<syn::Path>(&lit.value()) else {
+        return;
+    };
+    for segment in path.segments {
+        v.record_ident(&segment.ident.to_string());
     }
 }
 
@@ -113,6 +147,27 @@ mod tests {
             helper.refs.iter().any(|r| r == "normalize"),
             "helper should ref normalize through the vec! macro; refs={:?}",
             helper.refs
+        );
+    }
+
+    #[test]
+    fn refs_from_attribute_string_paths_are_counted() {
+        let src = r#"
+fn default_gain() -> f64 { 1.0 }
+
+#[derive(Deserialize)]
+struct Config {
+    #[serde(default = "default_gain")]
+    gain: f64,
+}
+"#;
+        let mut items = parse_file(src).unwrap();
+        annotate_refs(&mut items, None);
+        let config = items.iter().find(|i| i.name == "Config").unwrap();
+        assert!(
+            config.refs.iter().any(|r| r == "default_gain"),
+            "Config should ref serde string default; refs={:?}",
+            config.refs
         );
     }
 }

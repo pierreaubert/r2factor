@@ -19,7 +19,11 @@ pub struct AdvisorOutcome {
     pub rejected: Vec<String>,
 }
 
-pub fn apply_reply(plan: &Plan, items: &[ParsedItem], reply: AdvisorReply) -> Result<AdvisorOutcome> {
+pub fn apply_reply(
+    plan: &Plan,
+    items: &[ParsedItem],
+    reply: AdvisorReply,
+) -> Result<AdvisorOutcome> {
     let mut new = Plan {
         assignments: plan.assignments.clone(),
         rationale: plan.rationale.clone(),
@@ -54,10 +58,7 @@ pub fn apply_reply(plan: &Plan, items: &[ParsedItem], reply: AdvisorReply) -> Re
         if let Some(v) = new.assignments.get_mut(&from) {
             v.retain(|x| *x != mv.id);
         }
-        new.assignments
-            .entry(dest.clone())
-            .or_default()
-            .push(mv.id);
+        new.assignments.entry(dest.clone()).or_default().push(mv.id);
         new.rationale
             .insert(mv.id, format!("LLM move from `{from}`"));
         already_moved.insert(mv.id);
@@ -150,15 +151,23 @@ mod tests {
     fn applies_rename_and_move() {
         let (plan, items) = three_item_plan();
         let reply = AdvisorReply {
-            renames: [("misc".to_string(), "core".to_string())].into_iter().collect(),
-            moves: vec![AdvisorMove { id: 2, to: "core".to_string() }],
+            renames: [("misc".to_string(), "core".to_string())]
+                .into_iter()
+                .collect(),
+            moves: vec![AdvisorMove {
+                id: 2,
+                to: "core".to_string(),
+            }],
         };
         let out = apply_reply(&plan, &items, reply).unwrap();
         let core = out.plan.assignments.get("core").unwrap();
         assert_eq!(core.len(), 3);
         assert!(!out.plan.assignments.contains_key("misc"));
         assert_eq!(out.applied_moves.len(), 1);
-        assert_eq!(out.applied_renames, vec![("misc".to_string(), "core".to_string())]);
+        assert_eq!(
+            out.applied_renames,
+            vec![("misc".to_string(), "core".to_string())]
+        );
     }
 
     #[test]
@@ -166,7 +175,10 @@ mod tests {
         let (plan, items) = three_item_plan();
         let reply = AdvisorReply {
             renames: Default::default(),
-            moves: vec![AdvisorMove { id: 99, to: "elsewhere".to_string() }],
+            moves: vec![AdvisorMove {
+                id: 99,
+                to: "elsewhere".to_string(),
+            }],
         };
         let out = apply_reply(&plan, &items, reply).unwrap();
         assert!(out.rejected.iter().any(|r| r.contains("unknown id 99")));

@@ -91,6 +91,34 @@ fn compile_check(tmp_root: &Path, stem: &str) {
     }
 }
 
+fn compile_test_check(tmp_root: &Path, stem: &str) {
+    let lib_path = tmp_root.join("lib.rs");
+    fs::write(&lib_path, format!("#![allow(warnings)]\npub mod {stem};\n")).expect("write lib.rs");
+
+    let out_dir = tmp_root.join("rustc-test-out");
+    fs::create_dir_all(&out_dir).expect("mkdir rustc-test-out");
+
+    let output = Command::new("rustc")
+        .arg("--edition=2024")
+        .arg("--test")
+        .arg("-Awarnings")
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .arg(&lib_path)
+        .output()
+        .expect("invoke rustc --test");
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let facade = fs::read_to_string(tmp_root.join(format!("{stem}.rs")))
+            .unwrap_or_else(|_| "<facade unreadable>".into());
+        panic!(
+            "split test output for stem `{stem}` failed to compile.\n\n--- rustc stderr ---\n{stderr}\n--- rustc stdout ---\n{stdout}\n--- facade ---\n{facade}"
+        );
+    }
+}
+
 fn compile_existing_lib(tmp_root: &Path) {
     let lib_path = tmp_root.join("lib.rs");
     let out_dir = tmp_root.join("rustc-out");
@@ -113,6 +141,81 @@ fn compile_existing_lib(tmp_root: &Path) {
         let lib = fs::read_to_string(&lib_path).unwrap_or_else(|_| "<lib.rs unreadable>".into());
         panic!(
             "split lib.rs failed to compile.\n\n--- rustc stderr ---\n{stderr}\n--- rustc stdout ---\n{stdout}\n--- lib.rs ---\n{lib}"
+        );
+    }
+}
+
+#[test]
+fn sidecar_module_rs_keeps_its_facade_file() {
+    let src = r#"use std::fmt;
+
+pub struct Runner {
+    value: u32,
+}
+
+impl Runner {
+    pub fn new() -> Self {
+        Self { value: adjust(1) }
+    }
+}
+
+impl fmt::Display for Runner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.value)
+    }
+}
+
+fn adjust(value: u32) -> u32 {
+    value + 1
+}
+"#;
+    let (tmp, facade, sub_dir) = split_in_tempdir("helper", src);
+
+    assert!(
+        facade.exists(),
+        "splitting helper.rs must leave helper.rs as the module facade"
+    );
+    assert!(
+        sub_dir.join("runner.rs").exists(),
+        "sidecar split should place generated buckets under helper/"
+    );
+    assert!(
+        !sub_dir.join("mod.rs").exists(),
+        "sidecar modules should not require helper/mod.rs when helper.rs is the declared module"
+    );
+
+    let facade_src = fs::read_to_string(&facade).expect("read facade");
+    assert!(
+        facade_src.contains("mod runner;"),
+        "helper.rs should declare generated child modules directly; got:\n{facade_src}"
+    );
+    compile_check(tmp.path(), "helper");
+}
+
+fn compile_binary_root(path: &Path) {
+    let out_dir = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("rustc-out");
+    fs::create_dir_all(&out_dir).expect("mkdir rustc-out");
+
+    let output = Command::new("rustc")
+        .arg("--edition=2024")
+        .arg("--emit=metadata")
+        .arg("-Awarnings")
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .arg(path)
+        .output()
+        .expect("invoke rustc");
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let facade = fs::read_to_string(path).unwrap_or_else(|_| "<facade unreadable>".into());
+        panic!(
+            "split binary root {} failed to compile.\n\n--- rustc stderr ---\n{stderr}\n--- rustc stdout ---\n{stdout}\n--- facade ---\n{facade}",
+            path.display()
         );
     }
 }
@@ -213,6 +316,30 @@ fn normalize(s: &str) -> String { s.trim().to_lowercase() }
 }
 
 #[test]
+fn promoted_helper_private_return_type_gets_promoted_too() {
+    let src = r#"pub struct Caller;
+
+impl Caller {
+    pub fn value(&self) -> u32 { make_hidden().value() }
+}
+
+struct Hidden {
+    value: u32,
+}
+
+impl Hidden {
+    fn value(&self) -> u32 { self.value }
+}
+
+fn make_hidden() -> Hidden {
+    Hidden { value: 7 }
+}
+"#;
+    let (tmp, _facade, _sub_dir) = split_in_tempdir("private_return", src);
+    compile_check(tmp.path(), "private_return");
+}
+
+#[test]
 fn unit_tests_follow_tested_bucket_and_cross_bucket_tests_stay_in_tests() {
     let src = r#"pub struct Parser;
 
@@ -259,6 +386,71 @@ fn parser_lexer_integration_test() {
     );
 
     compile_check(tmp.path(), "test_place");
+}
+
+#[test]
+fn inline_test_module_is_unwrapped_and_relative_includes_rebased() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let stem = "nested_tests";
+    let file = tmp.path().join(format!("{stem}.rs"));
+    fs::write(tmp.path().join("fixture.txt"), "ok").expect("write fixture");
+    fs::write(
+        &file,
+        r#"pub struct Parser;
+
+impl Parser {
+    pub fn parse(&self) -> &'static str { include_str!("fixture.txt") }
+}
+
+pub struct Lexer;
+
+impl Lexer {
+    pub fn lex(&self) -> usize { 2 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parser_reads_fixture() {
+        assert_eq!(Parser.parse(), "ok");
+        assert_eq!(Lexer.lex(), 2);
+    }
+}
+"#,
+    )
+    .expect("write source");
+
+    let opts = SplitOptions {
+        use_tokensave: false,
+        llm: None,
+        write: Some(WriteOptions {
+            force: false,
+            recursive_max_lines: Some(0),
+        }),
+    };
+    run_split(&file, opts).expect("run_split succeeds");
+
+    let sub_dir = tmp.path().join(stem);
+    let tests_src = fs::read_to_string(sub_dir.join("tests.rs")).expect("tests.rs");
+    assert!(
+        !tests_src.contains("mod tests"),
+        "tests.rs should contain the inline test body, not a nested module; got:\n{tests_src}"
+    );
+    assert!(
+        tests_src.contains("fn parser_reads_fixture"),
+        "tests.rs should keep the original test body; got:\n{tests_src}"
+    );
+
+    let parser_src = fs::read_to_string(sub_dir.join("parser.rs")).expect("parser.rs");
+    assert!(
+        parser_src.contains("include_str!(\"../fixture.txt\")"),
+        "include_str! path should be rebased from subdir to original dir; got:\n{parser_src}"
+    );
+
+    compile_check(tmp.path(), stem);
+    compile_test_check(tmp.path(), stem);
 }
 
 #[test]
@@ -490,6 +682,98 @@ fn test_only() {
 }
 
 #[test]
+fn splits_main_rs_with_path_attributed_child_modules() {
+    let src = r#"
+pub struct Widget {
+    value: u32,
+}
+
+impl Widget {
+    pub fn new() -> Self {
+        Self { value: 7 }
+    }
+}
+
+fn describe(widget: &Widget) -> u32 {
+    widget.value
+}
+
+fn main() {
+    let widget = Widget::new();
+    assert_eq!(describe(&widget), 7);
+}
+"#;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let file = tmp.path().join("main.rs");
+    fs::write(&file, src).expect("write main.rs");
+
+    run_split(
+        &file,
+        SplitOptions {
+            use_tokensave: false,
+            llm: None,
+            write: Some(WriteOptions {
+                force: false,
+                recursive_max_lines: Some(0),
+            }),
+        },
+    )
+    .expect("split main.rs");
+
+    let facade_src = fs::read_to_string(&file).expect("read generated main.rs");
+    assert!(
+        facade_src.contains("#[path = \"main/"),
+        "main.rs facade must path-attribute child modules; got:\n{facade_src}"
+    );
+    compile_binary_root(&file);
+}
+
+#[test]
+fn splits_bin_crate_root_with_path_attributed_child_modules() {
+    let src = r#"
+pub struct Widget {
+    value: u32,
+}
+
+fn describe(widget: &Widget) -> u32 {
+    widget.value
+}
+
+fn main() {
+    let widget = Widget { value: 7 };
+    assert_eq!(describe(&widget), 7);
+}
+"#;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let bin_dir = tmp.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("mkdir bin");
+    let file = bin_dir.join("tool.rs");
+    fs::write(&file, src).expect("write bin/tool.rs");
+
+    run_split(
+        &file,
+        SplitOptions {
+            use_tokensave: false,
+            llm: None,
+            write: Some(WriteOptions {
+                force: false,
+                recursive_max_lines: Some(0),
+            }),
+        },
+    )
+    .expect("split bin/tool.rs");
+
+    let facade_src = fs::read_to_string(&file).expect("read generated bin/tool.rs");
+    assert!(
+        facade_src.contains("#[path = \"tool/"),
+        "bin crate root facade must path-attribute child modules; got:\n{facade_src}"
+    );
+    compile_binary_root(&file);
+}
+
+#[test]
 fn splits_mod_rs_in_place_without_declaring_mod_mod() {
     let src = r#"pub struct Foo;
 pub struct Bar;
@@ -591,6 +875,298 @@ pub struct Baz;
         "existing lib/ modules should still be re-exported; got:\n{facade_src}"
     );
     compile_existing_lib(tmp.path());
+}
+
+#[test]
+fn external_mod_decls_stay_at_facade_scope() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let module_dir = tmp.path().join("demo");
+    fs::create_dir_all(&module_dir).expect("mkdir demo");
+    let file = module_dir.join("mod.rs");
+    fs::write(
+        module_dir.join("functions.rs"),
+        "pub fn answer() -> u32 { 42 }\n",
+    )
+    .expect("write functions.rs");
+    fs::write(
+        &file,
+        r#"pub mod functions;
+pub use functions::answer;
+
+pub struct Foo;
+pub struct Bar;
+pub struct Baz;
+"#,
+    )
+    .expect("write mod.rs");
+
+    run_split(
+        &file,
+        SplitOptions {
+            use_tokensave: false,
+            llm: None,
+            write: Some(WriteOptions {
+                force: false,
+                recursive_max_lines: Some(0),
+            }),
+        },
+    )
+    .expect("split mod.rs");
+
+    let facade_src = fs::read_to_string(&file).expect("read generated mod.rs");
+    assert!(
+        facade_src.contains("pub mod functions;"),
+        "external module declaration should be preserved; got:\n{facade_src}"
+    );
+    assert!(
+        !facade_src.contains("\nmod functions;"),
+        "existing functions.rs should not be redeclared as a generated sibling; got:\n{facade_src}"
+    );
+    compile_check(tmp.path(), "demo");
+}
+
+#[test]
+fn local_module_use_roots_rebase_for_generated_subfiles() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let module_dir = tmp.path().join("demo");
+    fs::create_dir_all(&module_dir).expect("mkdir demo");
+    let file = module_dir.join("mod.rs");
+    fs::write(
+        module_dir.join("filters.rs"),
+        "pub(crate) struct XtcFilters;\nimpl XtcFilters { pub(crate) fn new() -> Self { Self } }\n",
+    )
+    .expect("write filters.rs");
+    fs::write(
+        &file,
+        r#"mod filters;
+use filters::XtcFilters;
+
+pub struct Plugin;
+
+impl Plugin {
+    pub fn build() -> XtcFilters {
+        XtcFilters::new()
+    }
+}
+
+pub struct Widget;
+"#,
+    )
+    .expect("write mod.rs");
+
+    run_split(
+        &file,
+        SplitOptions {
+            use_tokensave: false,
+            llm: None,
+            write: Some(WriteOptions {
+                force: false,
+                recursive_max_lines: Some(0),
+            }),
+        },
+    )
+    .expect("split mod.rs");
+
+    let plugin_src = fs::read_to_string(module_dir.join("plugin.rs")).expect("read plugin.rs");
+    assert!(
+        plugin_src.contains("use super::filters::XtcFilters;"),
+        "local module-root imports must be rebased for subfiles; got:\n{plugin_src}"
+    );
+    compile_check(tmp.path(), "demo");
+}
+
+#[test]
+fn cfg_attrs_stay_attached_to_external_mod_decls() {
+    let src = r#"#[cfg(feature = "onnx")]
+mod ml_inference;
+
+pub struct Plugin;
+pub struct Widget;
+"#;
+    let (tmp, facade, _sub_dir) = split_in_tempdir("demo", src);
+
+    let facade_src = fs::read_to_string(&facade).expect("read facade");
+    assert!(
+        facade_src.contains("#[cfg(feature = \"onnx\")]\nmod ml_inference;"),
+        "cfg attr should stay attached to the external mod declaration; got:\n{facade_src}"
+    );
+    assert!(
+        !facade_src.contains("\nmod ml_inference;\nmod"),
+        "external cfg-gated module should not also be emitted as an unconditional generated module; got:\n{facade_src}"
+    );
+    compile_check(tmp.path(), "demo");
+}
+
+#[test]
+fn generated_bucket_renames_around_external_mod_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let module_dir = tmp.path().join("demo");
+    fs::create_dir_all(&module_dir).expect("mkdir demo");
+    let file = module_dir.join("mod.rs");
+    fs::write(module_dir.join("types.rs"), "pub struct ExternalType;\n")
+        .expect("write existing types.rs");
+    fs::write(
+        &file,
+        r#"mod types;
+pub use types::ExternalType;
+
+pub struct Types;
+
+pub struct Widget;
+"#,
+    )
+    .expect("write mod.rs");
+
+    run_split(
+        &file,
+        SplitOptions {
+            use_tokensave: false,
+            llm: None,
+            write: Some(WriteOptions {
+                force: false,
+                recursive_max_lines: Some(0),
+            }),
+        },
+    )
+    .expect("split mod.rs");
+
+    assert_eq!(
+        fs::read_to_string(module_dir.join("types.rs")).expect("read existing types.rs"),
+        "pub struct ExternalType;\n",
+        "external types.rs must not be overwritten by a generated types bucket"
+    );
+    assert!(
+        module_dir.join("types_mod.rs").exists(),
+        "generated bucket should be renamed away from the external module file"
+    );
+    compile_check(tmp.path(), "demo");
+}
+
+#[test]
+fn item_macro_invocations_stay_in_facade() {
+    let src = r#"use std::cell::Cell;
+
+thread_local! {
+    static HIT: Cell<u32> = Cell::new(7);
+}
+
+pub fn read_hit() -> u32 {
+    HIT.with(|v| v.get())
+}
+
+pub struct Widget;
+
+impl Widget {
+    pub fn read(&self) -> u32 {
+        read_hit()
+    }
+}
+"#;
+    let (tmp, facade, sub_dir) = split_in_tempdir("demo", src);
+
+    let facade_src = fs::read_to_string(&facade).expect("read facade");
+    assert!(
+        facade_src.contains("thread_local!"),
+        "thread_local! invocation should remain in the facade; got:\n{facade_src}"
+    );
+    let generated = fs::read_to_string(sub_dir.join("misc.rs"))
+        .or_else(|_| fs::read_to_string(sub_dir.join("widget.rs")))
+        .expect("read generated subfile");
+    assert!(
+        generated.contains("use super::HIT;"),
+        "subfile using macro-defined static should import it from the facade; got:\n{generated}"
+    );
+    compile_check(tmp.path(), "demo");
+}
+
+#[test]
+fn include_macros_stay_in_facade_scope() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let file = tmp.path().join("demo.rs");
+    fs::write(
+        tmp.path().join("generated_impl.inc.rs"),
+        "impl Demo { fn generated(&self) -> u32 { 9 } }\n",
+    )
+    .expect("write include");
+    fs::write(
+        &file,
+        r#"include!("generated_impl.inc.rs");
+
+pub struct Demo;
+
+impl Demo {
+    pub fn value(&self) -> u32 {
+        self.generated()
+    }
+}
+
+pub struct Foo;
+pub struct Bar;
+"#,
+    )
+    .expect("write source");
+
+    run_split(
+        &file,
+        SplitOptions {
+            use_tokensave: false,
+            llm: None,
+            write: Some(WriteOptions {
+                force: false,
+                recursive_max_lines: Some(0),
+            }),
+        },
+    )
+    .expect("split demo.rs");
+
+    let facade_src = fs::read_to_string(&file).expect("read facade");
+    assert!(
+        facade_src.contains("include!(\"generated_impl.inc.rs\");"),
+        "include! should remain in the facade's scope; got:\n{facade_src}"
+    );
+    compile_check(tmp.path(), "demo");
+}
+
+#[test]
+fn crate_visible_items_are_reexported_through_facade() {
+    let (tmp, _facade, _sub_dir) = split_in_tempdir(
+        "demo",
+        r#"pub(crate) fn helper() -> u32 {
+    3
+}
+
+pub fn call() -> u32 {
+    helper()
+}
+
+pub struct Foo;
+pub struct Bar;
+"#,
+    );
+
+    let lib_path = tmp.path().join("lib.rs");
+    fs::write(
+        &lib_path,
+        "#![allow(warnings)]\npub mod demo;\npub fn outside() -> u32 { demo::helper() }\n",
+    )
+    .expect("write lib.rs");
+    let out_dir = tmp.path().join("rustc-out-crate-visible");
+    fs::create_dir_all(&out_dir).expect("mkdir out");
+    let output = Command::new("rustc")
+        .arg("--edition=2024")
+        .arg("--crate-type=lib")
+        .arg("--emit=metadata")
+        .arg("-Awarnings")
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .arg(&lib_path)
+        .output()
+        .expect("invoke rustc");
+    assert!(
+        output.status.success(),
+        "crate-visible helper should remain reachable through demo::helper; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
