@@ -21,6 +21,7 @@ pub mod rewrite;
 pub mod spec;
 pub mod symbol_graph;
 pub mod tokensave;
+pub mod verify;
 pub mod workspace_model;
 pub mod write;
 

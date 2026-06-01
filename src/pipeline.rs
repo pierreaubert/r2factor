@@ -31,13 +31,21 @@ pub struct SplitWriteTree {
 }
 
 pub fn split_write_tree(path: &Path, opts: SplitOptions) -> Result<SplitWriteTree> {
+    split_write_tree_inner(path, opts, false)
+}
+
+pub fn split_write_tree_with_output(path: &Path, opts: SplitOptions) -> Result<SplitWriteTree> {
+    split_write_tree_inner(path, opts, true)
+}
+
+fn split_write_tree_inner(path: &Path, opts: SplitOptions, emit: bool) -> Result<SplitWriteTree> {
     if path.is_dir() {
         anyhow::bail!(
             "split_write_tree requires a file path, got directory {}",
             path.display()
         );
     }
-    run_split_inner(path, &opts, 0, false)?
+    run_split_inner(path, &opts, 0, emit)?
         .ok_or_else(|| anyhow::anyhow!("split_write_tree requires write options"))
 }
 
@@ -564,7 +572,4 @@ fn report_write(report: &WriteReport) {
         eprintln!("[write]   {}", f.display());
     }
     eprintln!("[write] facade -> {}", report.facade.display());
-    eprintln!(
-        "[write] run `cargo check` next; private items used cross-bucket may need pub(super) promotion."
-    );
 }

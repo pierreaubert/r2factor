@@ -11,7 +11,6 @@ use crate::item::{ItemId, ItemVis, ParsedItem};
 use crate::plan::Plan;
 use quote::ToTokens;
 use std::collections::{BTreeMap, BTreeSet};
-use syn::visit::{self, Visit};
 
 /// Extract verbatim `#[cfg(...)]` attribute source from an item's source
 /// text. Used to gate cross-imports on the same cfg as the target item —
@@ -427,6 +426,11 @@ impl<'ast> syn::visit::Visit<'ast> for BodyPathRebaser {
         record_leading_super(&item.tree, &mut self.points);
     }
 
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        syn::visit::visit_path(self, &mac.path);
+        record_leading_super_in_tokens(mac.tokens.clone(), &mut self.points);
+    }
+
     fn visit_path(&mut self, p: &'ast syn::Path) {
         if let Some(first) = p.segments.first()
             && first.ident == "super"
@@ -438,6 +442,38 @@ impl<'ast> syn::visit::Visit<'ast> for BodyPathRebaser {
         // also processed (e.g. `Foo<super::Bar>`).
         syn::visit::visit_path(self, p);
     }
+}
+
+fn record_leading_super_in_tokens(
+    tokens: proc_macro2::TokenStream,
+    points: &mut Vec<(usize, usize)>,
+) {
+    use proc_macro2::TokenTree;
+
+    let tokens: Vec<TokenTree> = tokens.into_iter().collect();
+    for (idx, token) in tokens.iter().enumerate() {
+        match token {
+            TokenTree::Ident(ident)
+                if ident == "super" && next_tokens_are_path_sep(&tokens, idx + 1) =>
+            {
+                let start = ident.span().start();
+                points.push((start.line, start.column));
+            }
+            TokenTree::Group(group) => {
+                record_leading_super_in_tokens(group.stream(), points);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn next_tokens_are_path_sep(tokens: &[proc_macro2::TokenTree], idx: usize) -> bool {
+    use proc_macro2::TokenTree;
+    matches!(
+        (tokens.get(idx), tokens.get(idx + 1)),
+        (Some(TokenTree::Punct(a)), Some(TokenTree::Punct(b)))
+            if a.as_char() == ':' && b.as_char() == ':'
+    )
 }
 
 /// Walk a `UseTree` looking for a leading `super` segment. Records the
@@ -473,29 +509,41 @@ pub fn rebase_pub_super_in_subfile(source: &str) -> String {
     let Ok(file) = syn::parse_file(source) else {
         return source.to_string();
     };
-    let mut collector = PubSuperCollector {
-        source,
-        edits: Vec::new(),
-    };
-    collector.visit_file(&file);
-    if collector.edits.is_empty() {
+    let mut v = PubSuperVisibilityRebaser::default();
+    syn::visit::visit_file(&mut v, &file);
+    if v.rewrites.is_empty() {
         return source.to_string();
     }
-    let mut out = source.to_string();
-    collector.edits.sort_by_key(|edit| edit.0);
-    collector.edits.dedup_by_key(|edit| edit.0);
-    for (pos, insert) in collector.edits.into_iter().rev() {
+    let mut rewrites: Vec<(usize, &'static str)> = v
+        .rewrites
+        .iter()
+        .filter_map(|(line, col, insert)| {
+            line_col_to_byte_offset(source, *line, *col).map(|pos| (pos, *insert))
+        })
+        .collect();
+    if rewrites.is_empty() {
+        return source.to_string();
+    }
+    rewrites.sort_by_key(|(pos, _)| *pos);
+    rewrites.dedup();
+    let extra_len: usize = rewrites.iter().map(|(_, insert)| insert.len()).sum();
+    let mut out = String::with_capacity(source.len() + extra_len);
+    out.push_str(source);
+    for &(pos, insert) in rewrites.iter().rev() {
+        if pos > out.len() {
+            return source.to_string();
+        }
         out.insert_str(pos, insert);
     }
     out
 }
 
-struct PubSuperCollector<'a> {
-    source: &'a str,
-    edits: Vec<(usize, &'static str)>,
+#[derive(Default)]
+struct PubSuperVisibilityRebaser {
+    rewrites: Vec<(usize, usize, &'static str)>,
 }
 
-impl<'ast> Visit<'ast> for PubSuperCollector<'_> {
+impl<'ast> syn::visit::Visit<'ast> for PubSuperVisibilityRebaser {
     fn visit_visibility(&mut self, vis: &'ast syn::Visibility) {
         let syn::Visibility::Restricted(r) = vis else {
             return;
@@ -509,24 +557,16 @@ impl<'ast> Visit<'ast> for PubSuperCollector<'_> {
         if path_segments != ["super"] {
             return;
         }
-        let super_ident_span = r
-            .path
-            .segments
-            .first()
-            .expect("checked length above")
-            .ident
-            .span();
-        let start = super_ident_span.start();
-        let Some(pos) = line_col_to_byte_offset(self.source, start.line, start.column) else {
+        let Some(super_ident) = r.path.segments.first() else {
             return;
         };
-        let insert = if self.source[..pos].ends_with("pub(in ") {
+        let start = super_ident.ident.span().start();
+        let insert = if r.in_token.is_some() {
             "super::"
         } else {
             "in super::"
         };
-        self.edits.push((pos, insert));
-        visit::visit_visibility(self, vis);
+        self.rewrites.push((start.line, start.column, insert));
     }
 }
 
@@ -1421,6 +1461,15 @@ mod tests {
     }
 
     #[test]
+    fn rebase_body_super_paths_inside_macro_tokens() {
+        let src = "fn f() { let _ = vec![super::a(), super::b()]; }";
+        assert_eq!(
+            rebase_body_super_for_subfile(src),
+            "fn f() { let _ = vec![super::super::a(), super::super::b()]; }"
+        );
+    }
+
+    #[test]
     fn rebase_pub_super_widens_to_in_super_super() {
         let src = "pub(super) fn helper() {}";
         assert_eq!(
@@ -1446,15 +1495,27 @@ mod tests {
             rebase_pub_super_in_subfile(src),
             "pub(in super::super) struct S { pub(in super::super) v: u32 }\nimpl S { pub(in super::super) fn get(&self) -> u32 { self.v } }"
         );
+        syn::parse_file(&rebase_pub_super_in_subfile(src)).expect("must parse");
     }
 
     #[test]
-    fn rebase_pub_in_super_rewrites_without_double_in() {
+    fn rebase_pub_super_nested_fields_and_impl_items() {
+        let src = "struct S { pub(super) v: u32 }\nimpl S { pub(super) fn new() -> Self { Self { v: 1 } } }";
+        assert_eq!(
+            rebase_pub_super_in_subfile(src),
+            "struct S { pub(in super::super) v: u32 }\nimpl S { pub(in super::super) fn new() -> Self { Self { v: 1 } } }"
+        );
+        syn::parse_file(&rebase_pub_super_in_subfile(src)).expect("must parse");
+    }
+
+    #[test]
+    fn rebase_pub_in_super_widens_without_duplicate_in() {
         let src = "pub(in super) fn helper() {}";
         assert_eq!(
             rebase_pub_super_in_subfile(src),
             "pub(in super::super) fn helper() {}"
         );
+        syn::parse_file(&rebase_pub_super_in_subfile(src)).expect("must parse");
     }
 
     #[test]

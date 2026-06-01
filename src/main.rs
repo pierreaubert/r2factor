@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 use r2factor::SplitOptions;
 use r2factor::combine::CombineOptions;
 use r2factor::llm::LlmConfig;
@@ -192,6 +192,9 @@ enum Cmd {
         /// also selects source files over this threshold. Use 0 to disable.
         #[arg(long, requires = "write", default_value_t = 1000)]
         max_lines: usize,
+        /// Skip post-write Cargo verification.
+        #[arg(long = "no-verify", default_value_t = true, action = ArgAction::SetFalse)]
+        verify: bool,
     },
 }
 
@@ -634,6 +637,7 @@ fn main() -> Result<()> {
             write,
             force,
             max_lines,
+            verify,
         } => {
             let opts = SplitOptions {
                 use_tokensave: !no_tokensave,
@@ -648,7 +652,19 @@ fn main() -> Result<()> {
                     recursive_max_lines: Some(max_lines),
                 }),
             };
-            r2factor::run_split(&file, opts)
+            if write {
+                if file.is_dir() {
+                    r2factor::run_split(&file, opts)?;
+                } else {
+                    let tree = r2factor::pipeline::split_write_tree_with_output(&file, opts)?;
+                    if verify {
+                        r2factor::verify::verify_split_with_rollback(&file, &tree)?;
+                    }
+                }
+            } else {
+                r2factor::run_split(&file, opts)?;
+            }
+            Ok(())
         }
     }
 }

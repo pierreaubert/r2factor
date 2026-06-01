@@ -392,6 +392,8 @@ fn trait_method_hint_is_used(binding: &str, idents: &HashSet<String>) -> bool {
                 || idents.contains("decode")
                 || idents.contains("decode_vec")
         }
+        "DecodeAll" => idents.contains("decode_all"),
+        "Encode" => idents.contains("encode") || idents.contains("using_encoded"),
         "Rng" => {
             idents.contains("random")
                 || idents.contains("random_range")
@@ -574,6 +576,13 @@ fn trait_method_hint_is_used(binding: &str, idents: &HashSet<String>) -> bool {
                 || idents.contains("write_usize")
         }
         "Seek" => idents.contains("seek"),
+        "SliceRandom" => {
+            idents.contains("shuffle")
+                || idents.contains("choose")
+                || idents.contains("choose_multiple")
+                || idents.contains("choose_weighted")
+                || idents.contains("partial_shuffle")
+        }
         _ => false,
     }
 }
@@ -1543,6 +1552,28 @@ mod tests {
                 source: "use sotf_audio_player::ui_params::TuiEditablePlugin;".to_string(),
                 refs: Vec::new(),
             },
+            ParsedItem {
+                id: 21,
+                kind: ItemKind::Use,
+                name: String::new(),
+                vis: ItemVis::Private,
+                is_cfg_test: false,
+                line_start: 22,
+                line_end: 22,
+                source: "use codec::{DecodeAll, Encode};".to_string(),
+                refs: Vec::new(),
+            },
+            ParsedItem {
+                id: 22,
+                kind: ItemKind::Use,
+                name: String::new(),
+                vis: ItemVis::Private,
+                is_cfg_test: false,
+                line_start: 23,
+                line_end: 23,
+                source: "use rand::seq::SliceRandom;".to_string(),
+                refs: Vec::new(),
+            },
         ];
         let idents = HashSet::from([
             "absoluteString".to_string(),
@@ -1562,6 +1593,7 @@ mod tests {
             "invert".to_string(),
             "objectAtIndex".to_string(),
             "StdRng".to_string(),
+            "decode_all".to_string(),
             "encode".to_string(),
             "from_rng".to_string(),
             "general_purpose".to_string(),
@@ -1578,6 +1610,7 @@ mod tests {
             "setState_".to_string(),
             "set_volume".to_string(),
             "shutdown".to_string(),
+            "shuffle".to_string(),
             "split_word_bound_indices".to_string(),
             "theme".to_string(),
             "write_all".to_string(),
@@ -1633,6 +1666,9 @@ mod tests {
         );
         assert!(rendered.contains("ThemeExt"), "rendered={rendered}");
         assert!(rendered.contains("AccessibilityExt"), "rendered={rendered}");
+        assert!(rendered.contains("DecodeAll"), "rendered={rendered}");
+        assert!(rendered.contains("Encode"), "rendered={rendered}");
+        assert!(rendered.contains("SliceRandom"), "rendered={rendered}");
     }
 
     #[test]

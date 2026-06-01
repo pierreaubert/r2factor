@@ -15,6 +15,7 @@ use std::fmt::Write;
 /// bucket needs so the bare-name references to *promoted* items in other
 /// sub-buckets still resolve (since `pub use <bkt>::*;` only re-exports
 /// `pub` items, the wildcard chain doesn't reach `pub(super)` items).
+#[allow(clippy::too_many_arguments)]
 pub fn render_sub_file(
     module: &str,
     ids: &[ItemId],

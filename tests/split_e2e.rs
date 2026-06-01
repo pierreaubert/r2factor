@@ -563,6 +563,81 @@ impl Report {
 }
 
 #[test]
+fn original_pub_super_fields_and_methods_remain_parent_visible() {
+    let src = r#"pub(super) struct External {
+    pub(super) value: u32,
+}
+
+impl External {
+    pub(super) fn new(value: u32) -> Self {
+        Self { value }
+    }
+}
+
+pub struct Vis;
+
+impl Vis {
+    pub fn local() -> u32 {
+        External::new(1).value
+    }
+}
+"#;
+    let (tmp, _facade, sub_dir) = split_in_tempdir("vis", src);
+    let external_src = fs::read_to_string(sub_dir.join("external.rs")).expect("external.rs");
+    assert!(
+        external_src.contains("pub(in super::super) value")
+            && external_src.contains("pub(in super::super) fn new"),
+        "existing pub(super) visibilities should rebase to the original parent scope; got:\n{external_src}"
+    );
+
+    fs::write(
+        tmp.path().join("lib.rs"),
+        r#"#![allow(warnings)]
+pub mod vis;
+
+pub fn parent_can_still_access_original_pub_super() -> u32 {
+    vis::External::new(2).value
+}
+"#,
+    )
+    .expect("write lib.rs");
+    compile_existing_lib(tmp.path());
+}
+
+#[test]
+fn body_super_paths_inside_macros_are_rebased_for_subfiles() {
+    let src = r#"pub fn collect() -> Vec<u32> {
+    vec![super::outer(), super::outer()]
+}
+"#;
+    let (tmp, _facade, sub_dir) = split_in_tempdir("macro_super", src);
+    let collect_src = fs::read_dir(&sub_dir)
+        .expect("read subdir")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .find_map(|path| {
+            let src = fs::read_to_string(path).ok()?;
+            src.contains("fn collect").then_some(src)
+        })
+        .expect("generated file containing collect");
+    assert!(
+        collect_src.contains("vec![super::super::outer(), super::super::outer()]"),
+        "macro token paths should be rebased from the generated subfile; got:\n{collect_src}"
+    );
+
+    fs::write(
+        tmp.path().join("lib.rs"),
+        r#"#![allow(warnings)]
+fn outer() -> u32 { 1 }
+pub mod macro_super;
+"#,
+    )
+    .expect("write lib.rs");
+    compile_existing_lib(tmp.path());
+}
+
+#[test]
 fn repr_c_data_items_stay_in_facade_for_source_scanning_codegen() {
     let src = r#"#[repr(C)]
 enum ShaderInputIndex {
@@ -1144,17 +1219,7 @@ pub struct Baz;
         !facade_src.contains("\nmod functions;"),
         "existing functions.rs should not be redeclared as a generated sibling; got:\n{facade_src}"
     );
-    let check = Command::new("cargo")
-        .arg("check")
-        .current_dir(tmp.path())
-        .output()
-        .expect("cargo check demo");
-    assert!(
-        check.status.success(),
-        "cargo check failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr)
-    );
+    compile_check(tmp.path(), "demo");
 }
 
 #[test]
@@ -1217,17 +1282,7 @@ pub struct Other;
         generated.contains("super::functions::value()"),
         "moved bare module path should be rebased; got:\n{generated}"
     );
-    let check = Command::new("cargo")
-        .arg("check")
-        .current_dir(tmp.path())
-        .output()
-        .expect("cargo check demo");
-    assert!(
-        check.status.success(),
-        "cargo check failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr)
-    );
+    compile_check(tmp.path(), "demo");
 }
 
 #[test]
@@ -1283,17 +1338,7 @@ pub struct Widget;
         plugin_src.contains("use super::filters::XtcFilters as LocalFilters;"),
         "nested local module-root imports must be rebased for subfiles; got:\n{plugin_src}"
     );
-    let check = Command::new("cargo")
-        .arg("check")
-        .current_dir(tmp.path())
-        .output()
-        .expect("cargo check demo");
-    assert!(
-        check.status.success(),
-        "cargo check failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr)
-    );
+    compile_check(tmp.path(), "demo");
 }
 
 #[test]
