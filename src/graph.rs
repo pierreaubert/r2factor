@@ -46,7 +46,7 @@ pub fn annotate_refs(items: &mut [ParsedItem], evidence: Option<&CrossFileEviden
     }
 }
 
-fn collect_refs(src: &str, names: &HashSet<String>, self_name: &str) -> Vec<String> {
+pub fn collect_refs(src: &str, names: &HashSet<String>, self_name: &str) -> Vec<String> {
     let Ok(file) = syn::parse_file(src) else {
         return Vec::new();
     };

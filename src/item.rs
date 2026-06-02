@@ -1,11 +1,12 @@
 use anyhow::{Context, Result};
 use quote::ToTokens;
+use serde::Serialize;
 use syn::spanned::Spanned;
 use syn::{Attribute, Item, Type, Visibility};
 
 pub type ItemId = usize;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub enum ItemKind {
     Fn {
         is_test: bool,
@@ -30,7 +31,7 @@ pub enum ItemKind {
     Verbatim,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum ItemVis {
     Public,
     /// `pub(crate)`
@@ -45,7 +46,7 @@ pub enum ItemVis {
     Private,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ParsedItem {
     pub id: ItemId,
     pub kind: ItemKind,
@@ -54,6 +55,7 @@ pub struct ParsedItem {
     pub is_cfg_test: bool,
     pub line_start: usize,
     pub line_end: usize,
+    #[serde(skip_serializing)]
     pub source: String,
     pub refs: Vec<String>,
 }

@@ -3,7 +3,7 @@
 //! it to fold cross-symbol edges into our intra-file ref graph.
 
 mod evidence;
-mod matching;
+pub mod matching;
 
 use crate::item::ParsedItem;
 use anyhow::{Context, Result};

@@ -280,3 +280,78 @@ fn unknown_method_returns_jsonrpc_error() {
             .contains("unknown method")
     );
 }
+
+#[test]
+fn discover_tool_returns_index_and_edges() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join("a.rs"), "pub fn helper() {}\n").unwrap();
+    std::fs::write(tmp.path().join("b.rs"), "pub fn caller() { helper(); }\n").unwrap();
+
+    let mut sess = McpSession::start();
+    let resp = sess.request(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "discover",
+            "arguments": {
+                "path": tmp.path(),
+            },
+        },
+    }));
+    let data = tool_data(&resp);
+    let files = data["files"].as_array().expect("files array");
+    assert_eq!(files.len(), 2);
+    let items = data["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 2);
+    let edges = data["edges"].as_array().expect("edges array");
+    assert!(
+        !edges.is_empty(),
+        "should find at least one cross-file edge"
+    );
+}
+
+#[test]
+fn spec_validate_tool_reports_errors() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let spec_path = tmp.path().join("bad.yaml");
+    std::fs::write(
+        &spec_path,
+        r#"
+modules:
+  - name: dup
+    patterns: ["*A"]
+    visibility: pub
+  - name: dup
+    patterns: ["*B"]
+    visibility: bad_vis
+"#,
+    )
+    .unwrap();
+
+    let mut sess = McpSession::start();
+    let resp = sess.request(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "spec_validate",
+            "arguments": {
+                "spec": spec_path,
+            },
+        },
+    }));
+    let data = tool_data(&resp);
+    assert_eq!(data["valid"], false);
+    let errors = data["errors"].as_array().expect("errors array");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.as_str().unwrap().contains("duplicate"))
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.as_str().unwrap().contains("visibility"))
+    );
+}

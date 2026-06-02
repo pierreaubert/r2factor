@@ -32,6 +32,42 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Discover all `.rs` files under a directory, parse them, and print a
+    /// global item index + reference graph. Non-destructive.
+    Discover {
+        /// Directory to scan. Defaults to cwd.
+        path: Option<PathBuf>,
+        /// Output the discovery as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Skip tokensave discovery even if available.
+        #[arg(long)]
+        no_tokensave: bool,
+    },
+    /// Validate an architecture spec file (JSON or YAML) and report errors
+    /// and warnings.
+    SpecValidate {
+        /// Path to the spec file.
+        spec: PathBuf,
+        /// Output the validation report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Build a global refactoring plan from an architecture spec and a
+    /// codebase directory. Non-destructive — produces a dry-run report.
+    Plan {
+        /// Path to the architecture spec file.
+        spec: PathBuf,
+        /// Directory to discover. Defaults to cwd.
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Skip tokensave discovery even if available.
+        #[arg(long)]
+        no_tokensave: bool,
+        /// Output the plan as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Run r2factor as an MCP (Model Context Protocol) server over stdio.
     /// Lets an MCP-aware client (Claude Code, IDE extensions, etc.)
     /// discover and call `split_dry_run` and `split_write` as tools.
@@ -171,6 +207,83 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 print!("{}", r2factor::health::human_report(&report));
+            }
+            Ok(())
+        }
+        Cmd::Discover {
+            path,
+            json,
+            no_tokensave,
+        } => {
+            let path = path.unwrap_or(std::env::current_dir()?);
+            let disc = r2factor::discover::discover_dir(&path, !no_tokensave)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&disc)?);
+            } else {
+                print!("{}", r2factor::discover::human_report(&disc));
+            }
+            Ok(())
+        }
+        Cmd::SpecValidate { spec, json } => {
+            let s = r2factor::spec::parse_spec(&spec)?;
+            let report = r2factor::spec::validate(&s);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "valid": report.is_valid(),
+                        "errors": report.errors,
+                        "warnings": report.warnings,
+                    }))?
+                );
+            } else {
+                if report.is_valid() {
+                    println!("✓ spec is valid");
+                } else {
+                    println!("✗ spec is invalid");
+                }
+                for e in &report.errors {
+                    println!("  error: {e}");
+                }
+                for w in &report.warnings {
+                    println!("  warning: {w}");
+                }
+            }
+            if report.is_valid() {
+                Ok(())
+            } else {
+                std::process::exit(1);
+            }
+        }
+        Cmd::Plan {
+            spec,
+            path,
+            no_tokensave,
+            json,
+        } => {
+            let s = r2factor::spec::parse_spec(&spec)?;
+            let report = r2factor::spec::validate(&s);
+            if !report.is_valid() {
+                eprintln!("spec is invalid; aborting");
+                for e in &report.errors {
+                    eprintln!("  error: {e}");
+                }
+                std::process::exit(1);
+            }
+            let path = path.unwrap_or(std::env::current_dir()?);
+            let disc = r2factor::discover::discover_dir(&path, !no_tokensave)?;
+            let plan = r2factor::global_plan::build_plan(&disc, &s);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "assignments": plan.assignments,
+                        "violations": plan.violations,
+                        "operations": plan.operations,
+                    }))?
+                );
+            } else {
+                print!("{}", r2factor::global_plan::human_report(&plan, &disc));
             }
             Ok(())
         }

@@ -2649,6 +2649,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "libyaml-rs"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e126dda6f34391ab7b444f9922055facc83c07a910da3eb16f1e4d9c45dc777"
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3242,9 +3248,9 @@ dependencies = [
  "syn",
  "tempfile",
  "tokensave",
- "tokensave-large-treesitters 0.5.0",
  "tokio",
  "ureq 2.12.1",
+ "yaml_serde",
 ]
 
 [[package]]
@@ -3485,6 +3491,12 @@ name = "rustversion"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
+
+[[package]]
+name = "ryu"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "same-file"
@@ -3957,7 +3969,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokensave"
-version = "6.1.1"
+version = "6.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c747cc18027ed6579defed5fdcc536601b0bf19b8c7a2205628220ef322a46d1"
 dependencies = [
  "bincode",
  "cc",
@@ -3984,7 +3998,7 @@ dependencies = [
  "sysinfo",
  "tar",
  "thiserror 2.0.18",
- "tokensave-large-treesitters 0.5.0 (git+https://github.com/aovestdipaperino/tokensave-large-treesitters)",
+ "tokensave-large-treesitters",
  "tokio",
  "tokio-util",
  "toml",
@@ -4003,42 +4017,8 @@ dependencies = [
 [[package]]
 name = "tokensave-large-treesitters"
 version = "0.5.0"
-dependencies = [
- "arborium-kotlin",
- "arborium-lean",
- "cc",
- "tokensave-medium-treesitters",
- "tree-sitter",
- "tree-sitter-batch",
- "tree-sitter-clojure-orchard",
- "tree-sitter-elixir",
- "tree-sitter-erlang",
- "tree-sitter-fortran",
- "tree-sitter-fsharp",
- "tree-sitter-glsl",
- "tree-sitter-gwbasic",
- "tree-sitter-haskell",
- "tree-sitter-julia",
- "tree-sitter-language",
- "tree-sitter-msbasic2",
- "tree-sitter-nix",
- "tree-sitter-objc",
- "tree-sitter-ocaml",
- "tree-sitter-pascal",
- "tree-sitter-perl",
- "tree-sitter-powershell",
- "tree-sitter-qbasic",
- "tree-sitter-r",
- "tree-sitter-sequel",
- "tree-sitter-toml-ng",
- "tree-sitter-vb-dotnet",
- "tree-sitter-zig",
-]
-
-[[package]]
-name = "tokensave-large-treesitters"
-version = "0.5.0"
-source = "git+https://github.com/aovestdipaperino/tokensave-large-treesitters#0fc87352c7aed190a43e7eaf70f146e8830371e3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e12f9884955f347b1c7323f263020af2a097811fe1994e5d974ac46411b971b0"
 dependencies = [
  "arborium-kotlin",
  "arborium-lean",
@@ -5515,6 +5495,19 @@ checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
 dependencies = [
  "libc",
  "rustix 1.1.4",
+]
+
+[[package]]
+name = "yaml_serde"
+version = "0.10.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08c7c1b1a6a7c8a6b2741a6c21a4f8918e51899b111cfa08d1288202656e3975"
+dependencies = [
+ "indexmap 2.14.0",
+ "itoa",
+ "libyaml-rs",
+ "ryu",
+ "serde",
 ]
 
 [[package]]

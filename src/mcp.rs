@@ -120,6 +120,9 @@ fn handle_initialize(_params: &serde_json::Value) -> serde_json::Value {
 fn handle_tools_list() -> serde_json::Value {
     serde_json::json!({
         "tools": [
+            discover_descriptor(),
+            spec_validate_descriptor(),
+            plan_descriptor(),
             split_dry_run_descriptor(),
             split_write_descriptor(),
             combine_dry_run_descriptor(),
@@ -134,6 +137,118 @@ fn handle_tools_list() -> serde_json::Value {
             flatten_write_descriptor(),
         ],
     })
+}
+
+fn discover_descriptor() -> serde_json::Value {
+    serde_json::json!({
+        "name": "discover",
+        "description": "Walk a directory tree, discover all .rs files, parse them, and return a global item index plus a unified reference graph. Non-destructive — no files are touched. This is the foundation for whole-codebase refactoring.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Absolute or cwd-relative path to a directory to scan. Defaults to cwd.",
+                },
+                "use_tokensave": {
+                    "type": "boolean",
+                    "description": "If true and a .tokensave/ database is found, fold in cross-file semantic edges. Defaults to true.",
+                },
+            },
+        },
+    })
+}
+
+fn tool_discover(args: &serde_json::Value) -> Result<String, String> {
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+    let use_tokensave = args
+        .get("use_tokensave")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(true);
+    let disc = crate::discover::discover_dir(Path::new(path), use_tokensave)
+        .map_err(|e| format!("discover {path}: {e}"))?;
+    serde_json::to_string_pretty(&disc).map_err(|e| e.to_string())
+}
+
+fn spec_validate_descriptor() -> serde_json::Value {
+    serde_json::json!({
+        "name": "spec_validate",
+        "description": "Validate an architecture spec file (JSON or YAML) and report structural errors, duplicate modules, invalid visibility values, and malformed regex patterns.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "string",
+                    "description": "Absolute or cwd-relative path to the spec file.",
+                },
+            },
+            "required": ["spec"],
+        },
+    })
+}
+
+fn tool_spec_validate(args: &serde_json::Value) -> Result<String, String> {
+    let spec_path = require_string(args, "spec")?;
+    let spec = crate::spec::parse_spec(Path::new(&spec_path))
+        .map_err(|e| format!("parse spec {spec_path}: {e}"))?;
+    let report = crate::spec::validate(&spec);
+    serde_json::to_string_pretty(&serde_json::json!({
+        "valid": report.is_valid(),
+        "errors": report.errors,
+        "warnings": report.warnings,
+    }))
+    .map_err(|e| e.to_string())
+}
+
+fn plan_descriptor() -> serde_json::Value {
+    serde_json::json!({
+        "name": "plan",
+        "description": "Build a global refactoring plan from an architecture spec and a codebase directory. Matches items against spec patterns, clusters unmatched items by call-graph, detects boundary violations, and returns the planned assignments + operations. Non-destructive.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "string",
+                    "description": "Absolute or cwd-relative path to the architecture spec file (JSON or YAML).",
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Directory to discover. Defaults to cwd.",
+                },
+                "use_tokensave": {
+                    "type": "boolean",
+                    "description": "If true and a .tokensave/ database is found, fold in cross-file semantic edges. Defaults to true.",
+                },
+            },
+            "required": ["spec"],
+        },
+    })
+}
+
+fn tool_plan(args: &serde_json::Value) -> Result<String, String> {
+    let spec_path = require_string(args, "spec")?;
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+    let use_tokensave = args
+        .get("use_tokensave")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(true);
+
+    let spec = crate::spec::parse_spec(Path::new(&spec_path))
+        .map_err(|e| format!("parse spec {spec_path}: {e}"))?;
+    let report = crate::spec::validate(&spec);
+    if !report.is_valid() {
+        return Err(format!("spec is invalid: {}", report.errors.join("; ")));
+    }
+
+    let disc = crate::discover::discover_dir(Path::new(path), use_tokensave)
+        .map_err(|e| format!("discover {path}: {e}"))?;
+    let plan = crate::global_plan::build_plan(&disc, &spec);
+    serde_json::to_string_pretty(&serde_json::json!({
+        "assignments": plan.assignments,
+        "violations": plan.violations,
+        "operations": plan.operations,
+    }))
+    .map_err(|e| e.to_string())
 }
 
 fn split_dry_run_descriptor() -> serde_json::Value {
@@ -199,6 +314,9 @@ fn handle_tools_call(params: serde_json::Value) -> Result<serde_json::Value, Str
         .unwrap_or_else(|| serde_json::json!({}));
 
     let outcome = match name {
+        "discover" => tool_discover(&arguments),
+        "spec_validate" => tool_spec_validate(&arguments),
+        "plan" => tool_plan(&arguments),
         "split_dry_run" => tool_split_dry_run(&arguments),
         "split_write" => tool_split_write(&arguments),
         "combine_dry_run" => tool_combine_dry_run(&arguments),

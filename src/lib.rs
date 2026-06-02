@@ -3,7 +3,9 @@ pub mod carve;
 pub mod cluster;
 pub mod combine;
 pub mod consolidate;
+pub mod discover;
 pub mod flatten;
+pub mod global_plan;
 pub mod graph;
 pub mod health;
 pub mod item;
@@ -14,6 +16,8 @@ pub mod pipeline;
 pub mod plan;
 pub mod promote;
 pub mod refine;
+pub mod rewrite;
+pub mod spec;
 pub mod tokensave;
 pub mod write;
 
