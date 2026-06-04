@@ -181,6 +181,19 @@ fn make_assignment(
     }
 }
 
+/// Recompute the target assignment for an item after an advisory placement
+/// change. The refactor engine uses this for local-LLM suggestions so all path
+/// and visibility policy still flows through the deterministic planner.
+pub fn assignment_for_module(
+    discovery: &Discovery,
+    spec: &Spec,
+    item_id: GlobalItemId,
+    module_name: &str,
+    rationale: impl Into<String>,
+) -> ModuleAssignment {
+    make_assignment(discovery, spec, item_id, module_name, rationale)
+}
+
 fn module_visibility(spec: &Spec, module_name: &str) -> String {
     spec.modules
         .iter()
@@ -253,6 +266,7 @@ fn detect_violations(
     // Build a quick lookup: module -> set of modules it may depend on.
     let allowed_deps: BTreeMap<&str, BTreeSet<&str>> = spec
         .boundaries
+        .rules()
         .iter()
         .map(|b| {
             (
@@ -531,7 +545,10 @@ mod tests {
     use super::*;
     use crate::discover::{CargoInfo, CargoPackageInfo, DiscoveredFile, GlobalItem, RefEdge};
     use crate::item::{ItemKind, ItemVis};
-    use crate::spec::{BoundarySpec, DefaultsSpec, ModuleSpec, Pattern, Spec};
+    use crate::spec::{
+        BoundaryPolicy, BoundarySpec, ConfidencePolicy, DefaultsSpec, LayoutPolicy, LlmPolicy,
+        ModuleSpec, Pattern, Spec, VisibilityPolicy,
+    };
 
     fn fake_discovery(items: Vec<GlobalItem>, edges: Vec<RefEdge>) -> Discovery {
         let files: Vec<DiscoveredFile> = vec![DiscoveredFile {
@@ -577,7 +594,8 @@ mod tests {
                     output: None,
                 },
             ],
-            boundaries: vec![
+            version: 1,
+            boundaries: BoundaryPolicy::Legacy(vec![
                 BoundarySpec {
                     from: "domain".to_string(),
                     may_depend_on: vec![],
@@ -586,8 +604,12 @@ mod tests {
                     from: "app".to_string(),
                     may_depend_on: vec!["domain".to_string()],
                 },
-            ],
+            ]),
             defaults: DefaultsSpec::default(),
+            confidence: ConfidencePolicy::default(),
+            layout: LayoutPolicy::default(),
+            visibility: VisibilityPolicy::default(),
+            llm: LlmPolicy::default(),
         }
     }
 
@@ -684,10 +706,10 @@ mod tests {
         let edges = vec![RefEdge { from: 0, to: 1 }];
         let disc = fake_discovery(items, edges);
         let mut spec = simple_spec();
-        spec.boundaries = vec![BoundarySpec {
+        spec.boundaries = BoundaryPolicy::Legacy(vec![BoundarySpec {
             from: "app".to_string(),
             may_depend_on: vec!["domain".to_string()],
-        }];
+        }]);
 
         let plan = build_plan(&disc, &spec);
 

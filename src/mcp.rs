@@ -123,6 +123,10 @@ fn handle_tools_list() -> serde_json::Value {
             discover_descriptor(),
             spec_validate_descriptor(),
             plan_descriptor(),
+            refactor_plan_descriptor(),
+            refactor_preview_descriptor(),
+            refactor_write_descriptor(),
+            refactor_rollback_descriptor(),
             split_dry_run_descriptor(),
             split_write_descriptor(),
             combine_dry_run_descriptor(),
@@ -251,6 +255,138 @@ fn tool_plan(args: &serde_json::Value) -> Result<String, String> {
     .map_err(|e| e.to_string())
 }
 
+fn refactor_plan_descriptor() -> serde_json::Value {
+    serde_json::json!({
+        "name": "refactor_plan",
+        "description": "Build a typed whole-codebase migration plan with workspace ownership, symbol evidence, diagnostics, exact edit intents, and safety status. Non-destructive.",
+        "inputSchema": refactor_schema(false, false),
+    })
+}
+
+fn refactor_preview_descriptor() -> serde_json::Value {
+    serde_json::json!({
+        "name": "refactor_preview",
+        "description": "Apply a whole-codebase refactor plan to a temporary copy and run parse/cargo checks. Non-destructive.",
+        "inputSchema": refactor_schema(false, false),
+    })
+}
+
+fn refactor_write_descriptor() -> serde_json::Value {
+    serde_json::json!({
+        "name": "refactor_write",
+        "description": "Write a whole-codebase refactor only after temp preview/checks pass. Requires confirm=true and creates a rollback manifest.",
+        "inputSchema": refactor_schema(true, false),
+    })
+}
+
+fn refactor_rollback_descriptor() -> serde_json::Value {
+    serde_json::json!({
+        "name": "refactor_rollback",
+        "description": "Restore files from a .r2factor-refactor-manifest.json produced by refactor_write.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "manifest": { "type": "string", "description": "Path to the write manifest." }
+            },
+            "required": ["manifest"],
+        },
+    })
+}
+
+fn refactor_schema(confirm: bool, llm: bool) -> serde_json::Value {
+    let mut props = serde_json::json!({
+        "spec": { "type": "string", "description": "Architecture spec file (JSON or YAML)." },
+        "path": { "type": "string", "description": "Workspace or package root. Defaults to cwd." },
+        "use_tokensave": { "type": "boolean", "description": "Use tokensave semantic evidence when available. Defaults to true." },
+        "use_rg_candidates": { "type": "boolean", "description": "Use rg as a text candidate finder. Defaults to true." },
+        "run_full_tests": { "type": "boolean", "description": "Run cargo test for affected packages after mandatory cargo check. Defaults to false." },
+    });
+    if confirm {
+        props["confirm"] = serde_json::json!({
+            "type": "boolean",
+            "description": "Must be true for refactor_write."
+        });
+    }
+    if llm {
+        props["llm"] = serde_json::json!({ "type": "boolean" });
+    }
+    serde_json::json!({
+        "type": "object",
+        "properties": props,
+        "required": ["spec"],
+    })
+}
+
+fn refactor_options(
+    args: &serde_json::Value,
+    mode: crate::refactor::RefactorMode,
+) -> crate::refactor::RefactorOptions {
+    crate::refactor::RefactorOptions {
+        use_tokensave: args
+            .get("use_tokensave")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(true),
+        require_tokensave_for_rewrites: true,
+        use_rg_candidates: args
+            .get("use_rg_candidates")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(true),
+        llm: None,
+        run_full_tests: args
+            .get("run_full_tests")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false),
+        mode,
+    }
+}
+
+fn tool_refactor_plan(args: &serde_json::Value) -> Result<String, String> {
+    let spec_path = require_string(args, "spec")?;
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+    let spec = crate::spec::parse_spec(Path::new(spec_path))
+        .map_err(|e| format!("parse spec {spec_path}: {e}"))?;
+    let opts = refactor_options(args, crate::refactor::RefactorMode::Plan);
+    let report = crate::refactor::refactor_plan(Path::new(path), &spec, &opts)
+        .map_err(|e| format!("refactor plan: {e}"))?;
+    serde_json::to_string_pretty(&report).map_err(|e| e.to_string())
+}
+
+fn tool_refactor_preview(args: &serde_json::Value) -> Result<String, String> {
+    let spec_path = require_string(args, "spec")?;
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+    let spec = crate::spec::parse_spec(Path::new(spec_path))
+        .map_err(|e| format!("parse spec {spec_path}: {e}"))?;
+    let opts = refactor_options(args, crate::refactor::RefactorMode::Preview);
+    let report = crate::refactor::refactor_preview(Path::new(path), &spec, &opts)
+        .map_err(|e| format!("refactor preview: {e}"))?;
+    serde_json::to_string_pretty(&report).map_err(|e| e.to_string())
+}
+
+fn tool_refactor_write(args: &serde_json::Value) -> Result<String, String> {
+    if !args
+        .get("confirm")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false)
+    {
+        return Err("refactor_write requires confirm=true".to_string());
+    }
+    let spec_path = require_string(args, "spec")?;
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+    let spec = crate::spec::parse_spec(Path::new(spec_path))
+        .map_err(|e| format!("parse spec {spec_path}: {e}"))?;
+    let opts = refactor_options(args, crate::refactor::RefactorMode::Write);
+    let report = crate::refactor::refactor_write(Path::new(path), &spec, &opts)
+        .map_err(|e| format!("refactor write: {e}"))?;
+    serde_json::to_string_pretty(&report).map_err(|e| e.to_string())
+}
+
+fn tool_refactor_rollback(args: &serde_json::Value) -> Result<String, String> {
+    let manifest = require_string(args, "manifest")?;
+    let report = crate::refactor::refactor_rollback_manifest(Path::new(manifest))
+        .map_err(|e| format!("refactor rollback: {e}"))?;
+    serde_json::to_string_pretty(&report).map_err(|e| e.to_string())
+}
+
 fn split_dry_run_descriptor() -> serde_json::Value {
     serde_json::json!({
         "name": "split_dry_run",
@@ -317,6 +453,10 @@ fn handle_tools_call(params: serde_json::Value) -> Result<serde_json::Value, Str
         "discover" => tool_discover(&arguments),
         "spec_validate" => tool_spec_validate(&arguments),
         "plan" => tool_plan(&arguments),
+        "refactor_plan" => tool_refactor_plan(&arguments),
+        "refactor_preview" => tool_refactor_preview(&arguments),
+        "refactor_write" => tool_refactor_write(&arguments),
+        "refactor_rollback" => tool_refactor_rollback(&arguments),
         "split_dry_run" => tool_split_dry_run(&arguments),
         "split_write" => tool_split_write(&arguments),
         "combine_dry_run" => tool_combine_dry_run(&arguments),

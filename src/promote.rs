@@ -11,6 +11,7 @@ use crate::item::{ItemId, ItemVis, ParsedItem};
 use crate::plan::Plan;
 use quote::ToTokens;
 use std::collections::{BTreeMap, BTreeSet};
+use syn::visit::{self, Visit};
 
 /// Extract verbatim `#[cfg(...)]` attribute source from an item's source
 /// text. Used to gate cross-imports on the same cfg as the target item —
@@ -472,71 +473,60 @@ pub fn rebase_pub_super_in_subfile(source: &str) -> String {
     let Ok(file) = syn::parse_file(source) else {
         return source.to_string();
     };
-    let Some(item) = file.items.first() else {
-        return source.to_string();
+    let mut collector = PubSuperCollector {
+        source,
+        edits: Vec::new(),
     };
-    let vis = item_vis(item);
-    let Some(vis) = vis else {
-        return source.to_string();
-    };
-    let syn::Visibility::Restricted(r) = vis else {
-        return source.to_string();
-    };
-    // We only specialize the bare `pub(super)` form. `pub(in super)` parses
-    // as Restricted with the same single-segment path; that's fine — same
-    // rewrite. Any longer path we leave alone (could be `pub(in crate::x)`
-    // which is already absolute, or `pub(in super::y)` which would need a
-    // different rebase rule).
-    let path_segments: Vec<String> = r
-        .path
-        .segments
-        .iter()
-        .map(|s| s.ident.to_string())
-        .collect();
-    if path_segments != ["super"] {
+    collector.visit_file(&file);
+    if collector.edits.is_empty() {
         return source.to_string();
     }
-    // Find the byte span of the `super` token inside the `pub(...)` and
-    // splice in an extra `super::` before it.
-    let super_ident_span = r
-        .path
-        .segments
-        .first()
-        .expect("checked length above")
-        .ident
-        .span();
-    let start = super_ident_span.start();
-    let Some(pos) = line_col_to_byte_offset(source, start.line, start.column) else {
-        return source.to_string();
-    };
-    // `pub(super)` -> `pub(in super::super)`. We need to add `in ` before
-    // the existing `super` AND another `super::` immediately after. Doing
-    // both in one splice keeps the byte offset unambiguous.
-    let mut out = String::with_capacity(source.len() + "in super::".len());
-    out.push_str(&source[..pos]);
-    out.push_str("in super::");
-    out.push_str(&source[pos..]);
+    let mut out = source.to_string();
+    collector.edits.sort_by_key(|edit| edit.0);
+    collector.edits.dedup_by_key(|edit| edit.0);
+    for (pos, insert) in collector.edits.into_iter().rev() {
+        out.insert_str(pos, insert);
+    }
     out
 }
 
-/// Pulled out so [`rebase_pub_super_in_subfile`] can read the visibility of
-/// any item kind without re-implementing the giant match.
-fn item_vis(item: &syn::Item) -> Option<&syn::Visibility> {
-    use syn::Item;
-    match item {
-        Item::Const(i) => Some(&i.vis),
-        Item::Enum(i) => Some(&i.vis),
-        Item::ExternCrate(i) => Some(&i.vis),
-        Item::Fn(i) => Some(&i.vis),
-        Item::Static(i) => Some(&i.vis),
-        Item::Struct(i) => Some(&i.vis),
-        Item::Trait(i) => Some(&i.vis),
-        Item::TraitAlias(i) => Some(&i.vis),
-        Item::Type(i) => Some(&i.vis),
-        Item::Union(i) => Some(&i.vis),
-        Item::Use(i) => Some(&i.vis),
-        Item::Mod(i) => Some(&i.vis),
-        _ => None,
+struct PubSuperCollector<'a> {
+    source: &'a str,
+    edits: Vec<(usize, &'static str)>,
+}
+
+impl<'ast> Visit<'ast> for PubSuperCollector<'_> {
+    fn visit_visibility(&mut self, vis: &'ast syn::Visibility) {
+        let syn::Visibility::Restricted(r) = vis else {
+            return;
+        };
+        let path_segments: Vec<String> = r
+            .path
+            .segments
+            .iter()
+            .map(|s| s.ident.to_string())
+            .collect();
+        if path_segments != ["super"] {
+            return;
+        }
+        let super_ident_span = r
+            .path
+            .segments
+            .first()
+            .expect("checked length above")
+            .ident
+            .span();
+        let start = super_ident_span.start();
+        let Some(pos) = line_col_to_byte_offset(self.source, start.line, start.column) else {
+            return;
+        };
+        let insert = if self.source[..pos].ends_with("pub(in ") {
+            "super::"
+        } else {
+            "in super::"
+        };
+        self.edits.push((pos, insert));
+        visit::visit_visibility(self, vis);
     }
 }
 
@@ -1446,6 +1436,24 @@ mod tests {
         assert_eq!(
             rebase_pub_super_in_subfile(src),
             "pub(in super::super) struct S { v: u32 }"
+        );
+    }
+
+    #[test]
+    fn rebase_pub_super_rewrites_fields_and_impl_items() {
+        let src = "pub(super) struct S { pub(super) v: u32 }\nimpl S { pub(super) fn get(&self) -> u32 { self.v } }";
+        assert_eq!(
+            rebase_pub_super_in_subfile(src),
+            "pub(in super::super) struct S { pub(in super::super) v: u32 }\nimpl S { pub(in super::super) fn get(&self) -> u32 { self.v } }"
+        );
+    }
+
+    #[test]
+    fn rebase_pub_in_super_rewrites_without_double_in() {
+        let src = "pub(in super) fn helper() {}";
+        assert_eq!(
+            rebase_pub_super_in_subfile(src),
+            "pub(in super::super) fn helper() {}"
         );
     }
 

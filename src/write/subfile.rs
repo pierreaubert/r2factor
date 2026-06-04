@@ -1,9 +1,10 @@
-use crate::item::{ItemId, ItemKind, ItemVis, ParsedItem};
+use crate::item::{ItemId, ItemKind, ParsedItem};
 use crate::promote::{
     CrossImport, add_pub_super, add_pub_super_to_fields, lift_impl_methods,
     rebase_body_super_for_subfile, rebase_pub_super_in_subfile,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use crate::write::uses;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write;
 
 /// Render one `<bucket>.rs` body. Items are emitted in original source order
@@ -23,6 +24,7 @@ pub fn render_sub_file(
     impl_lifts: &BTreeSet<ItemId>,
     field_lifts: &BTreeSet<ItemId>,
     imports: &BTreeSet<CrossImport>,
+    local_module_roots: &HashSet<String>,
     include_path_prefix: Option<&str>,
 ) -> String {
     let mut buf = String::new();
@@ -68,19 +70,19 @@ pub fn render_sub_file(
             buf.push_str("\n\n");
             continue;
         }
-        // 1) Apply the relevant *visibility* transform (item-keyword level).
+        // 1) Preserve the original `pub(super)` horizon before adding any
+        //    new splitter-local visibility. This catches nested visibilities
+        //    such as inherent impl methods and struct fields, while keeping
+        //    newly introduced `pub(super)` lifts scoped to the facade.
+        let original_scope_rebased = rebase_pub_super_in_subfile(&it.source);
         let after_vis = if promote.contains(&id) {
             // `add_pub_super` handles both keyword AND fields, so skip the
             // separate field lift below for this branch.
-            add_pub_super(&it.source)
+            add_pub_super(&original_scope_rebased)
         } else if impl_lifts.contains(&id) {
-            lift_impl_methods(&it.source)
-        } else if it.vis == ItemVis::Super {
-            // Original `pub(super)` items now live one module deeper;
-            // rebase to `pub(in super::super)` to preserve their scope.
-            rebase_pub_super_in_subfile(&it.source)
+            lift_impl_methods(&original_scope_rebased)
         } else {
-            it.source.clone()
+            original_scope_rebased
         };
         // 2) Field-only lift for structs/unions that already had enough
         //    type-level visibility (so weren't in `promote`) but whose
@@ -96,13 +98,56 @@ pub fn render_sub_file(
         //    `super::super::foo()`. Visibility paths are skipped by the
         //    visitor so the steps above are not double-rewritten.
         let mut final_src = rebase_body_super_for_subfile(&after_fields);
+        final_src = uses::rebase_use_roots_in_source(&final_src, local_module_roots);
+        final_src = uses::rebase_local_module_paths_in_source(&final_src, local_module_roots);
         if let Some(prefix) = include_path_prefix {
             final_src = rebase_include_macro_paths(&final_src, prefix);
+        }
+        if matches!(it.kind, ItemKind::Mod) && it.name != module {
+            final_src = add_bucket_scope_import_to_inline_module(&final_src);
         }
         buf.push_str(&final_src);
         buf.push_str("\n\n");
     }
     buf
+}
+
+fn add_bucket_scope_import_to_inline_module(src: &str) -> String {
+    if !is_inline_module_source(src) || src.contains("use super::*;") {
+        return src.to_string();
+    }
+    let Some(open) = src.find('{') else {
+        return src.to_string();
+    };
+    let mut insert = open + 1;
+    let after_open = &src[insert..];
+    for line in after_open.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("#![") {
+            insert += line.len();
+            continue;
+        }
+        break;
+    }
+
+    let mut out = String::with_capacity(src.len() + "    use super::*;\n".len() + 1);
+    out.push_str(&src[..insert]);
+    if insert == open + 1 {
+        out.push('\n');
+    }
+    out.push_str("    use super::*;\n");
+    out.push_str(&src[insert..]);
+    out
+}
+
+fn is_inline_module_source(src: &str) -> bool {
+    let Ok(file) = syn::parse_file(src) else {
+        return false;
+    };
+    matches!(
+        file.items.as_slice(),
+        [syn::Item::Mod(module)] if module.content.is_some()
+    )
 }
 
 fn unwrap_inline_module_source(src: &str) -> Option<String> {
@@ -169,4 +214,57 @@ fn find_string_literal_end(s: &str) -> Option<usize> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::item::{ItemVis, ParsedItem};
+
+    #[test]
+    fn moved_inline_module_can_see_generated_bucket_scope() {
+        let item = ParsedItem {
+            id: 0,
+            kind: ItemKind::Mod,
+            name: "nested".to_string(),
+            vis: ItemVis::Private,
+            is_cfg_test: false,
+            line_start: 1,
+            line_end: 6,
+            source: r#"mod nested {
+    #![allow(dead_code)]
+
+    pub fn call() -> u32 {
+        helper()
+    }
+}"#
+            .to_string(),
+            refs: Vec::new(),
+        };
+        let by_id = BTreeMap::from([(item.id, &item)]);
+
+        let rendered = render_sub_file(
+            "misc",
+            &[item.id],
+            &by_id,
+            "use super::helper;",
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &HashSet::new(),
+            None,
+        );
+
+        let attr_pos = rendered
+            .find("#![allow(dead_code)]")
+            .expect("inner attr in rendered source");
+        let import_pos = rendered
+            .find("use super::*;")
+            .expect("bucket scope import in rendered source");
+        assert!(
+            attr_pos < import_pos,
+            "bucket scope import should be inserted after inner attrs; got:\n{rendered}"
+        );
+    }
 }

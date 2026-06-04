@@ -109,12 +109,18 @@ pub fn parse_file(src: &str) -> Result<Vec<ParsedItem>> {
 
 fn make_parsed(id: ItemId, item: &Item, lines: &[&str]) -> ParsedItem {
     let attrs = item_attrs(item);
-    let line_start = attrs
+    let mut line_start = attrs
         .iter()
         .map(|a| a.span().start().line)
         .min()
         .unwrap_or_else(|| item.span().start().line);
     let line_end = item.span().end().line;
+    if let Item::Mod(module) = item
+        && module.content.is_some()
+    {
+        line_start =
+            repair_inline_mod_start(lines, line_start, line_end, &module.ident.to_string());
+    }
     let source = slice_lines(lines, line_start, line_end);
     let is_cfg_test = attrs.iter().any(is_cfg_test_attr);
 
@@ -141,6 +147,41 @@ fn slice_lines(lines: &[&str], start: usize, end: usize) -> String {
     let s = start - 1;
     let e = end.min(lines.len());
     lines[s..e].join("\n")
+}
+
+fn repair_inline_mod_start(lines: &[&str], start: usize, end: usize, name: &str) -> usize {
+    let source = slice_lines(lines, start, end);
+    if parses_as_inline_mod(&source, name) {
+        return start;
+    }
+
+    let start_idx = start.saturating_sub(1);
+    let search_start = start_idx.saturating_sub(50);
+    for idx in (search_start..start_idx).rev() {
+        let line = lines.get(idx).map_or("", |line| line.trim_start());
+        if !line.contains("mod") || !line.contains(name) || !line.contains('{') {
+            continue;
+        }
+        let candidate_start = idx + 1;
+        let candidate = slice_lines(lines, candidate_start, end);
+        if parses_as_inline_mod(&candidate, name) {
+            return candidate_start;
+        }
+    }
+
+    start
+}
+
+fn parses_as_inline_mod(source: &str, name: &str) -> bool {
+    matches!(
+        syn::parse_file(source),
+        Ok(file)
+            if matches!(
+                file.items.as_slice(),
+                [Item::Mod(module)]
+                    if module.ident == name && module.content.is_some()
+            )
+    )
 }
 
 fn item_attrs(item: &Item) -> &[Attribute] {
@@ -276,4 +317,43 @@ fn path_to_string(p: &syn::Path) -> String {
         .map(|s| s.ident.to_string())
         .collect::<Vec<_>>()
         .join("::")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inline_module_with_inner_attr_keeps_mod_wrapper() {
+        let src = r#"pub fn before() {}
+
+mod security {
+    #![allow(non_upper_case_globals)]
+    use super::*;
+
+    pub const errSecSuccess: i32 = 0;
+}
+"#;
+
+        let items = parse_file(src).expect("parse");
+        let module = items
+            .iter()
+            .find(|item| matches!(item.kind, ItemKind::Mod) && item.name == "security")
+            .expect("security module");
+        assert!(
+            module.source.starts_with("mod security {"),
+            "source should include the inline module wrapper, got:\n{}",
+            module.source
+        );
+        assert!(
+            module.source.contains("#![allow(non_upper_case_globals)]"),
+            "source should preserve inner attrs, got:\n{}",
+            module.source
+        );
+        assert!(
+            module.source.ends_with('}'),
+            "source should include the closing brace, got:\n{}",
+            module.source
+        );
+    }
 }

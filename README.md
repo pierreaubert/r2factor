@@ -94,13 +94,14 @@ consolidation), `check` (local readiness diagnostics), `backups` (inspect
 ### `split`
 
 ```
-r2factor split <file> [--write] [--force] [--no-tokensave] [--llm ...]
+r2factor split <file-or-dir> [--write] [--force] [--max-lines N] [--no-tokensave] [--llm ...]
 ```
 
 | flag | what it does |
 |---|---|
 | (none) | Dry-run. Prints the proposed split + cohesion report to stdout. No files touched. |
 | `--write` | Materialize the split. Writes the facade + sub-files. Creates `<file>.bak`. |
+| `--max-lines <N>` | With `--write`, recursively split generated files over `N` lines. If the input is a directory, first split every non-facade `.rs` file under it with more than `N` lines. Use `0` to disable threshold-driven recursive/directory splitting. |
 | `--force` | Required when generated bucket files would overwrite existing files; also purges stale generated `.rs` files in the split target. |
 | `--no-tokensave` | Skip the tokensave cross-symbol index even if a `.tokensave/` is found in an ancestor directory. |
 | `--llm` | Run an LLM advisor pass over the deterministic plan (renames misc-bucket names, moves obvious misplacements). |
@@ -121,6 +122,12 @@ r2factor split — 20 items across 10 proposed file(s)
 [write]   fixtures/sample/eval.rs
 ...
 [write] facade -> fixtures/sample.rs
+```
+
+Example — split every oversized Rust file under the current directory:
+
+```bash
+r2factor split --write --max-lines 1500 .
 ```
 
 The original is preserved at `fixtures/sample.rs.bak`. Re-running on the

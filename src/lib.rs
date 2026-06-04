@@ -15,10 +15,13 @@ pub mod names;
 pub mod pipeline;
 pub mod plan;
 pub mod promote;
+pub mod refactor;
 pub mod refine;
 pub mod rewrite;
 pub mod spec;
+pub mod symbol_graph;
 pub mod tokensave;
+pub mod workspace_model;
 pub mod write;
 
 pub use pipeline::run_split;

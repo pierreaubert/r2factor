@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use r2factor::SplitOptions;
 use r2factor::combine::CombineOptions;
 use r2factor::llm::LlmConfig;
+use r2factor::refactor::{RefactorMode, RefactorOptions};
 use r2factor::write::WriteOptions;
 use std::path::PathBuf;
 
@@ -67,6 +68,11 @@ enum Cmd {
         /// Output the plan as JSON.
         #[arg(long)]
         json: bool,
+    },
+    /// Safe whole-codebase refactor engine: plan, preview, write, or rollback.
+    Refactor {
+        #[command(subcommand)]
+        cmd: RefactorCmd,
     },
     /// Run r2factor as an MCP (Model Context Protocol) server over stdio.
     /// Lets an MCP-aware client (Claude Code, IDE extensions, etc.)
@@ -155,8 +161,9 @@ enum Cmd {
         #[arg(long)]
         write: bool,
     },
-    /// Propose how to split a single .rs file into a module of smaller files.
+    /// Split a Rust file, or with --write split every oversized .rs file under a directory.
     Split {
+        /// Rust source file, or a directory to scan when --write is set.
         file: PathBuf,
         /// Skip tokensave even when a `.tokensave/` is found.
         #[arg(long)]
@@ -181,9 +188,72 @@ enum Cmd {
         /// When writing, overwrite an existing target directory.
         #[arg(long, requires = "write")]
         force: bool,
-        /// Recursively split generated files above this many lines. Use 0 to disable.
+        /// Recursively split generated files above this many lines. For directory input,
+        /// also selects source files over this threshold. Use 0 to disable.
         #[arg(long, requires = "write", default_value_t = 1000)]
         max_lines: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum RefactorCmd {
+    /// Build a typed migration plan. Non-destructive.
+    Plan {
+        spec: PathBuf,
+        #[arg(long)]
+        path: Option<PathBuf>,
+        #[arg(long)]
+        no_tokensave: bool,
+        #[arg(long)]
+        no_rg: bool,
+        #[arg(long)]
+        llm: bool,
+        #[arg(long, default_value = "http://localhost:11434/v1/chat/completions")]
+        llm_endpoint: String,
+        #[arg(long, default_value = "llama3.2:3b")]
+        llm_model: String,
+        #[arg(long, env = "R2FACTOR_LLM_API_KEY", hide_env_values = true)]
+        llm_api_key: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Apply the migration plan to a temp copy and run checks.
+    Preview {
+        spec: PathBuf,
+        #[arg(long)]
+        path: Option<PathBuf>,
+        #[arg(long)]
+        no_tokensave: bool,
+        #[arg(long)]
+        no_rg: bool,
+        /// Also run cargo test for affected packages after mandatory cargo check.
+        #[arg(long)]
+        run_tests: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Write only after preview/checks pass. Requires --confirm.
+    Write {
+        spec: PathBuf,
+        #[arg(long)]
+        path: Option<PathBuf>,
+        #[arg(long)]
+        no_tokensave: bool,
+        #[arg(long)]
+        no_rg: bool,
+        #[arg(long)]
+        confirm: bool,
+        /// Also run cargo test for affected packages before and after writing.
+        #[arg(long)]
+        run_tests: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Restore files from a refactor write manifest.
+    Rollback {
+        manifest: PathBuf,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -287,6 +357,107 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Refactor { cmd } => match cmd {
+            RefactorCmd::Plan {
+                spec,
+                path,
+                no_tokensave,
+                no_rg,
+                llm,
+                llm_endpoint,
+                llm_model,
+                llm_api_key,
+                json,
+            } => {
+                let spec = r2factor::spec::parse_spec(&spec)?;
+                let path = path.unwrap_or(std::env::current_dir()?);
+                let opts = RefactorOptions {
+                    use_tokensave: !no_tokensave,
+                    require_tokensave_for_rewrites: true,
+                    use_rg_candidates: !no_rg,
+                    llm: llm.then_some(LlmConfig {
+                        endpoint: llm_endpoint,
+                        model: llm_model,
+                        timeout_secs: 120,
+                        api_key: llm_api_key,
+                    }),
+                    run_full_tests: false,
+                    mode: RefactorMode::Plan,
+                };
+                let report = r2factor::refactor::refactor_plan(&path, &spec, &opts)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                }
+                Ok(())
+            }
+            RefactorCmd::Preview {
+                spec,
+                path,
+                no_tokensave,
+                no_rg,
+                run_tests,
+                json,
+            } => {
+                let spec = r2factor::spec::parse_spec(&spec)?;
+                let path = path.unwrap_or(std::env::current_dir()?);
+                let opts = RefactorOptions {
+                    use_tokensave: !no_tokensave,
+                    require_tokensave_for_rewrites: true,
+                    use_rg_candidates: !no_rg,
+                    llm: None,
+                    run_full_tests: run_tests,
+                    mode: RefactorMode::Preview,
+                };
+                let report = r2factor::refactor::refactor_preview(&path, &spec, &opts)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                }
+                Ok(())
+            }
+            RefactorCmd::Write {
+                spec,
+                path,
+                no_tokensave,
+                no_rg,
+                confirm,
+                run_tests,
+                json,
+            } => {
+                if !confirm {
+                    anyhow::bail!("refactor write requires --confirm");
+                }
+                let spec = r2factor::spec::parse_spec(&spec)?;
+                let path = path.unwrap_or(std::env::current_dir()?);
+                let opts = RefactorOptions {
+                    use_tokensave: !no_tokensave,
+                    require_tokensave_for_rewrites: true,
+                    use_rg_candidates: !no_rg,
+                    llm: None,
+                    run_full_tests: run_tests,
+                    mode: RefactorMode::Write,
+                };
+                let report = r2factor::refactor::refactor_write(&path, &spec, &opts)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                }
+                Ok(())
+            }
+            RefactorCmd::Rollback { manifest, json } => {
+                let report = r2factor::refactor::refactor_rollback_manifest(&manifest)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                }
+                Ok(())
+            }
+        },
         Cmd::Mcp => r2factor::mcp::serve(),
         Cmd::Restore {
             backup,

@@ -10,11 +10,17 @@ use crate::plan::{self, Plan};
 use crate::tokensave::{CrossFileEvidence, Tokensave};
 use crate::write::{self, WriteReport};
 use anyhow::Result;
-use std::path::{Path, PathBuf};
+use serde::Deserialize;
+use std::collections::BTreeSet;
+use std::ffi::OsString;
+use std::path::{Component, Path, PathBuf};
 
 const DEFAULT_RECURSIVE_MAX_LINES: usize = 1000;
 
 pub fn run_split(path: &Path, opts: SplitOptions) -> Result<()> {
+    if path.is_dir() {
+        return run_split_dir(path, &opts, true);
+    }
     run_split_inner(path, &opts, 0, true).map(|_| ())
 }
 
@@ -25,8 +31,53 @@ pub struct SplitWriteTree {
 }
 
 pub fn split_write_tree(path: &Path, opts: SplitOptions) -> Result<SplitWriteTree> {
+    if path.is_dir() {
+        anyhow::bail!(
+            "split_write_tree requires a file path, got directory {}",
+            path.display()
+        );
+    }
     run_split_inner(path, &opts, 0, false)?
         .ok_or_else(|| anyhow::anyhow!("split_write_tree requires write options"))
+}
+
+fn run_split_dir(root: &Path, opts: &SplitOptions, emit: bool) -> Result<()> {
+    let Some(write_opts) = opts.write else {
+        anyhow::bail!(
+            "directory split requires --write so each selected file can be split in place"
+        );
+    };
+    let Some(max_lines) = write_opts.recursive_max_lines else {
+        anyhow::bail!("directory split requires a max-lines threshold");
+    };
+    if max_lines == 0 {
+        if emit {
+            eprintln!(
+                "[write] directory split disabled for {} because max-lines is 0",
+                root.display()
+            );
+        }
+        return Ok(());
+    }
+
+    let files = oversized_rust_files_under(root, max_lines)?;
+    if emit {
+        eprintln!(
+            "[write] directory split {} file(s) over {max_lines} lines under {}",
+            files.len(),
+            root.display()
+        );
+    }
+    for path in &files {
+        if emit {
+            eprintln!("[write] split {}", path.display());
+        }
+        run_split_inner(path, opts, 0, emit)?;
+    }
+    if emit {
+        verify_directory_split(root, &files)?;
+    }
+    Ok(())
 }
 
 fn run_split_inner(
@@ -120,6 +171,318 @@ fn oversized_written_files(paths: &[PathBuf], max_lines: usize) -> Result<Vec<Pa
         }
     }
     Ok(out)
+}
+
+fn oversized_rust_files_under(root: &Path, max_lines: usize) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    let include_targets = included_rust_files_under(root)?;
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                anyhow::bail!("read_dir {}: {e}", dir.display());
+            }
+        };
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                if matches!(
+                    name,
+                    ".git" | ".tokensave" | "target" | "node_modules" | "dist" | "build"
+                ) {
+                    continue;
+                }
+                stack.push(path);
+            } else if file_type.is_file()
+                && path.extension().and_then(|s| s.to_str()) == Some("rs")
+                && is_oversized_split_candidate(&path, max_lines, &include_targets)?
+            {
+                out.push(path);
+            }
+        }
+    }
+    out.sort_by(|a, b| path_depth(a).cmp(&path_depth(b)).then_with(|| a.cmp(b)));
+    Ok(out)
+}
+
+fn path_depth(path: &Path) -> usize {
+    path.components().count()
+}
+
+fn is_oversized_split_candidate(
+    path: &Path,
+    max_lines: usize,
+    include_targets: &BTreeSet<PathBuf>,
+) -> Result<bool> {
+    let src = std::fs::read_to_string(path)?;
+    if write::is_r2factor_facade(&src) {
+        return Ok(false);
+    }
+    if src.lines().count() <= max_lines {
+        return Ok(false);
+    }
+    if include_targets.contains(&normalize_path(path)) {
+        eprintln!(
+            "[write] skip {}: referenced by include! from another Rust source",
+            path.display()
+        );
+        return Ok(false);
+    }
+    if let Err(err) = item::parse_file(&src) {
+        eprintln!(
+            "[write] skip {}: cannot split non-standalone Rust source ({err})",
+            path.display()
+        );
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn included_rust_files_under(root: &Path) -> Result<BTreeSet<PathBuf>> {
+    let mut targets = BTreeSet::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir)?;
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                if matches!(
+                    name,
+                    ".git" | ".tokensave" | "target" | "node_modules" | "dist" | "build"
+                ) {
+                    continue;
+                }
+                stack.push(path);
+            } else if file_type.is_file() && path.extension().and_then(|s| s.to_str()) == Some("rs")
+            {
+                let src = std::fs::read_to_string(&path)?;
+                let Some(parent) = path.parent() else {
+                    continue;
+                };
+                for include_path in include_macro_paths(&src) {
+                    if !include_path.ends_with(".rs") {
+                        continue;
+                    }
+                    targets.insert(normalize_path(&parent.join(include_path)));
+                }
+            }
+        }
+    }
+    Ok(targets)
+}
+
+fn include_macro_paths(src: &str) -> Vec<String> {
+    let marker = "include!(\"";
+    let mut out = Vec::new();
+    let mut rest = src;
+    while let Some(pos) = rest.find(marker) {
+        let path_start = pos + marker.len();
+        let after_marker = &rest[path_start..];
+        let Some(path_end) = string_literal_end(after_marker) else {
+            break;
+        };
+        out.push(after_marker[..path_end].to_string());
+        rest = &after_marker[path_end..];
+    }
+    out
+}
+
+fn string_literal_end(s: &str) -> Option<usize> {
+    let mut escaped = false;
+    for (idx, ch) in s.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '"' => return Some(idx),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoMetadata {
+    packages: Vec<CargoPackage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoPackage {
+    name: String,
+    manifest_path: PathBuf,
+}
+
+fn verify_directory_split(root: &Path, changed_files: &[PathBuf]) -> Result<()> {
+    if changed_files.is_empty() {
+        eprintln!("[check] skipped: no files were split");
+        return Ok(());
+    }
+    let Some(manifest) = find_manifest(root) else {
+        eprintln!(
+            "[check] skipped: no Cargo.toml found above {}",
+            root.display()
+        );
+        return Ok(());
+    };
+    let workspace_root = manifest
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| root.to_path_buf());
+    let packages = affected_packages(&workspace_root, changed_files)?;
+    if packages.is_empty() {
+        if let Err(err) = run_cargo_report(&workspace_root, &["check"]) {
+            eprintln!(
+                "[test] not run: cargo check failed; after fixing, run `cargo test` for a full test report"
+            );
+            return Err(err);
+        }
+        eprintln!("[test] skipped: run `cargo test` for a full test report");
+        return Ok(());
+    }
+    let package_list = test_report_commands(&packages);
+    for package in &packages {
+        if let Err(err) = run_cargo_report(&workspace_root, &["check", "-p", package]) {
+            eprintln!(
+                "[test] not run: cargo check failed; after fixing, run {package_list} for a full test report"
+            );
+            return Err(err);
+        }
+    }
+    eprintln!("[test] skipped: run {package_list} for a full test report");
+    Ok(())
+}
+
+fn test_report_commands(packages: &BTreeSet<String>) -> String {
+    let package_list = packages
+        .iter()
+        .map(|pkg| format!("`cargo test -p {pkg}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    package_list
+}
+
+fn affected_packages(root: &Path, changed_files: &[PathBuf]) -> Result<BTreeSet<String>> {
+    let output = std::process::Command::new(cargo_program())
+        .arg("metadata")
+        .arg("--format-version")
+        .arg("1")
+        .arg("--no-deps")
+        .current_dir(root)
+        .output();
+    let output = match output {
+        Ok(output) => output,
+        Err(e) => {
+            anyhow::bail!("[check] cargo metadata failed to start: {e}");
+        }
+    };
+    if !output.status.success() {
+        anyhow::bail!(
+            "[check] cargo metadata failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let metadata: CargoMetadata = serde_json::from_slice(&output.stdout)?;
+    let changed: Vec<PathBuf> = changed_files
+        .iter()
+        .map(|path| path.canonicalize().unwrap_or_else(|_| path.clone()))
+        .collect();
+    let mut packages = BTreeSet::new();
+    for package in metadata.packages {
+        let manifest_dir = package
+            .manifest_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| root.to_path_buf());
+        let manifest_dir = manifest_dir
+            .canonicalize()
+            .unwrap_or_else(|_| manifest_dir.clone());
+        if changed.iter().any(|path| path.starts_with(&manifest_dir)) {
+            packages.insert(package.name);
+        }
+    }
+    Ok(packages)
+}
+
+fn run_cargo_report(root: &Path, args: &[&str]) -> Result<()> {
+    let command = format!("cargo {}", args.join(" "));
+    eprintln!("[check] {command}");
+    let output = std::process::Command::new(cargo_program())
+        .args(args)
+        .current_dir(root)
+        .output();
+    let output = match output {
+        Ok(output) => output,
+        Err(e) => {
+            anyhow::bail!("[check] {command} failed to start: {e}");
+        }
+    };
+    if output.status.success() {
+        eprintln!("[check] {command} ok");
+        return Ok(());
+    }
+    eprintln!("[check] {command} failed");
+    if !output.stdout.is_empty() {
+        eprintln!("--- {command} stdout ---");
+        eprintln!("{}", String::from_utf8_lossy(&output.stdout));
+    }
+    if !output.stderr.is_empty() {
+        eprintln!("--- {command} stderr ---");
+        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+    }
+    anyhow::bail!("[check] {command} failed")
+}
+
+fn cargo_program() -> OsString {
+    if let Some(cargo) = std::env::var_os("CARGO") {
+        return cargo;
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let candidate = PathBuf::from(home).join(".cargo/bin/cargo");
+        if candidate.is_file() {
+            return candidate.into_os_string();
+        }
+    }
+    OsString::from("cargo")
+}
+
+fn find_manifest(start: &Path) -> Option<PathBuf> {
+    let mut cur = if start.is_file() {
+        start.parent()?.to_path_buf()
+    } else {
+        start.to_path_buf()
+    };
+    loop {
+        let candidate = cur.join("Cargo.toml");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if !cur.pop() {
+            return None;
+        }
+    }
 }
 
 fn load_evidence(path: &Path, items: &[ParsedItem]) -> Option<CrossFileEvidence> {
