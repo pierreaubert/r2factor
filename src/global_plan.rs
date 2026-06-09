@@ -116,36 +116,33 @@ pub fn build_plan(discovery: &Discovery, spec: &Spec) -> GlobalPlan {
             }
         }
 
-        if let Some((best_module, count)) = module_counts.into_iter().max_by_key(|(_, c)| *c) {
-            if count > 0 {
-                assignments.insert(
+        if let Some((best_module, count)) = module_counts.into_iter().max_by_key(|(_, c)| *c)
+            && count > 0
+        {
+            assignments.insert(
+                id,
+                make_assignment(
+                    discovery,
+                    spec,
                     id,
-                    make_assignment(
-                        discovery,
-                        spec,
-                        id,
-                        &best_module,
-                        format!("call-graph: {count} ref(s) into `{best_module}`"),
-                    ),
-                );
-            }
+                    &best_module,
+                    format!("call-graph: {count} ref(s) into `{best_module}`"),
+                ),
+            );
         }
     }
 
     // 3. Fallback to defaults.
     for item in &discovery.items {
-        if !assignments.contains_key(&item.id) {
-            assignments.insert(
+        assignments.entry(item.id).or_insert_with(|| {
+            make_assignment(
+                discovery,
+                spec,
                 item.id,
-                make_assignment(
-                    discovery,
-                    spec,
-                    item.id,
-                    &spec.defaults.unmatched_module,
-                    "default fallback",
-                ),
-            );
-        }
+                &spec.defaults.unmatched_module,
+                "default fallback",
+            )
+        });
     }
 
     // 4. Detect violations.
@@ -211,25 +208,25 @@ fn compute_target_file(
     let crate_root = crate_root_for_source(discovery, source_file);
 
     // If the spec module has an explicit output template, use it.
-    if let Some(module) = spec.modules.iter().find(|m| m.name == module_name) {
-        if let Some(template) = &module.output {
-            let path = PathBuf::from(template.replace("{module}", module_name));
-            return if path.is_absolute() {
-                path
-            } else {
-                crate_root.join(path)
-            };
-        }
+    if let Some(module) = spec.modules.iter().find(|m| m.name == module_name)
+        && let Some(template) = &module.output
+    {
+        let path = PathBuf::from(template.replace("{module}", module_name));
+        return if path.is_absolute() {
+            path
+        } else {
+            crate_root.join(path)
+        };
     }
 
     crate_root.join("src").join(format!("{module_name}.rs"))
 }
 
 fn crate_root_for_source(discovery: &Discovery, source_file: &Path) -> PathBuf {
-    if let Some(cargo) = &discovery.cargo {
-        if let Some(pkg) = owning_package(&cargo.packages, source_file) {
-            return pkg.manifest_dir.clone();
-        }
+    if let Some(cargo) = &discovery.cargo
+        && let Some(pkg) = owning_package(&cargo.packages, source_file)
+    {
+        return pkg.manifest_dir.clone();
     }
 
     if discovery.root.file_name().is_some_and(|name| name == "src") {

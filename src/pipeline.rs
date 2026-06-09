@@ -384,12 +384,11 @@ fn verify_directory_split(root: &Path, changed_files: &[PathBuf]) -> Result<()> 
 }
 
 fn test_report_commands(packages: &BTreeSet<String>) -> String {
-    let package_list = packages
+    packages
         .iter()
         .map(|pkg| format!("`cargo test -p {pkg}`"))
         .collect::<Vec<_>>()
-        .join(", ");
-    package_list
+        .join(", ")
 }
 
 fn affected_packages(root: &Path, changed_files: &[PathBuf]) -> Result<BTreeSet<String>> {

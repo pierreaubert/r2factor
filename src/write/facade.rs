@@ -131,7 +131,12 @@ fn emit_mod_decl(buf: &mut String, module: &str, path_prefix: Option<&str>, attr
         let _ = writeln!(buf, "{attr}");
     }
     if let Some(prefix) = path_prefix {
-        let _ = writeln!(buf, "#[path = \"{prefix}/{module}.rs\"]");
+        let path = if prefix.is_empty() {
+            format!("{module}.rs")
+        } else {
+            format!("{prefix}/{module}.rs")
+        };
+        let _ = writeln!(buf, "#[path = \"{path}\"]");
     }
     let _ = writeln!(buf, "mod {module};");
 }

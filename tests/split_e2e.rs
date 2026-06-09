@@ -25,6 +25,7 @@ fn split_in_tempdir(stem: &str, src_text: &str) -> (tempfile::TempDir, PathBuf, 
     let tmp = tempfile::tempdir().expect("create tempdir");
     let file = tmp.path().join(format!("{stem}.rs"));
     fs::write(&file, src_text).expect("write source");
+    fs::write(tmp.path().join("README.md"), "fixture sibling\n").expect("write sibling");
 
     let opts = SplitOptions {
         // Tests must not depend on a `.tokensave/` database — the splitter
@@ -813,6 +814,91 @@ fn test_only() {
 }
 
 #[test]
+fn splits_only_file_in_directory_in_place() {
+    let src = r#"#![allow(dead_code)]
+
+pub struct Alpha;
+pub struct Beta;
+pub struct Gamma;
+
+pub fn value() -> u32 {
+    42
+}
+"#;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let file = tmp.path().join("widget.rs");
+    fs::write(&file, src).expect("write widget.rs");
+
+    run_split(
+        &file,
+        SplitOptions {
+            use_tokensave: false,
+            llm: None,
+            write: Some(WriteOptions {
+                force: false,
+                recursive_max_lines: Some(0),
+            }),
+        },
+    )
+    .expect("split widget.rs");
+
+    assert!(
+        tmp.path().join("types.rs").exists(),
+        "types.rs should be generated beside the only file in the directory"
+    );
+    assert!(
+        !tmp.path().join("widget").exists(),
+        "single-file directory split should not create a widget/ subdirectory"
+    );
+    let facade_src = fs::read_to_string(&file).expect("read generated widget.rs");
+    assert!(
+        facade_src.contains("#[path = \"types.rs\"]\nmod types;"),
+        "non-root in-place facade should path-attribute sibling modules; got:\n{facade_src}"
+    );
+
+    assert_parses(&file);
+    assert_parses(&tmp.path().join("types.rs"));
+    compile_check(tmp.path(), "widget");
+}
+
+#[test]
+fn existing_same_stem_directory_keeps_subdirectory_split() {
+    let src = r#"#![allow(dead_code)]
+
+pub struct Alpha;
+pub struct Beta;
+pub struct Gamma;
+"#;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let file = tmp.path().join("widget.rs");
+    fs::write(&file, src).expect("write widget.rs");
+    fs::create_dir_all(tmp.path().join("widget")).expect("mkdir widget");
+
+    run_split(
+        &file,
+        SplitOptions {
+            use_tokensave: false,
+            llm: None,
+            write: Some(WriteOptions {
+                force: false,
+                recursive_max_lines: Some(0),
+            }),
+        },
+    )
+    .expect("split widget.rs");
+
+    assert!(
+        tmp.path().join("widget").join("types.rs").exists(),
+        "existing same-stem directory should remain the split target"
+    );
+    let facade_src = fs::read_to_string(&file).expect("read generated widget.rs");
+    assert!(
+        facade_src.contains("mod types;") && !facade_src.contains("#[path = \"types.rs\"]"),
+        "facade should use normal child-module lookup for existing widget/ target dir; got:\n{facade_src}"
+    );
+}
+
+#[test]
 fn isolated_lib_subfile_imports_external_module_root_paths() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let file = tmp.path().join("lib.rs");
@@ -972,8 +1058,8 @@ fn main() {
 
     let facade_src = fs::read_to_string(&file).expect("read generated main.rs");
     assert!(
-        facade_src.contains("#[path = \"main/"),
-        "main.rs facade must path-attribute child modules; got:\n{facade_src}"
+        facade_src.contains("mod widget;") && !facade_src.contains("#[path = \"main/"),
+        "single-file main.rs split should use sibling modules; got:\n{facade_src}"
     );
     compile_binary_root(&file);
 }
@@ -1016,8 +1102,10 @@ fn main() {
 
     let facade_src = fs::read_to_string(&file).expect("read generated bin/tool.rs");
     assert!(
-        facade_src.contains("#[path = \"tool/"),
-        "bin crate root facade must path-attribute child modules; got:\n{facade_src}"
+        facade_src.contains("mod types;")
+            && facade_src.contains("mod widget;")
+            && !facade_src.contains("#[path = \"tool/"),
+        "single-file bin crate root split should use sibling modules; got:\n{facade_src}"
     );
     compile_binary_root(&file);
 }
@@ -2306,14 +2394,18 @@ fn recursively_splits_generated_files_over_line_threshold() {
     )
     .expect("recursive split succeeds");
 
-    let parse_file = tmp.path().join("recur").join("parse.rs");
+    let parse_file = if tmp.path().join("parse.rs").exists() {
+        tmp.path().join("parse.rs")
+    } else {
+        tmp.path().join("recur").join("parse.rs")
+    };
     let parse_src = fs::read_to_string(&parse_file).expect("read recursive facade");
     assert!(
         parse_src.contains("r2factor:facade"),
         "oversized generated parse.rs should be recursively split into a facade; got:\n{parse_src}"
     );
     assert!(
-        tmp.path().join("recur").join("parse.rs.bak").exists(),
+        parse_file.with_extension("rs.bak").exists(),
         "recursive split should back up the oversized generated file"
     );
     compile_check(tmp.path(), "recur");
@@ -2378,11 +2470,14 @@ fn split_write_directory_splits_all_files_over_line_threshold() {
         "nested/long_b.rs should become a facade; got:\n{long_b_src}"
     );
     assert!(
-        tmp.path()
-            .join("nested")
-            .join("long_b")
-            .join("render.rs")
-            .exists()
+        tmp.path().join("nested").join("render.rs").exists()
+            || tmp.path().join("nested").join("render_b.rs").exists()
+            || tmp
+                .path()
+                .join("nested")
+                .join("long_b")
+                .join("render.rs")
+                .exists()
             || tmp
                 .path()
                 .join("nested")

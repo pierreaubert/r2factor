@@ -137,18 +137,13 @@ impl Default for BoundaryPolicy {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BoundaryDefault {
+    #[default]
     Allow,
     Deny,
     Warn,
-}
-
-impl Default for BoundaryDefault {
-    fn default() -> Self {
-        BoundaryDefault::Allow
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -196,7 +191,7 @@ pub struct VisibilityPolicy {
     pub default: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LlmPolicy {
     #[serde(default)]
@@ -275,14 +270,6 @@ impl Default for VisibilityPolicy {
     fn default() -> Self {
         Self {
             default: default_visibility(),
-        }
-    }
-}
-
-impl Default for LlmPolicy {
-    fn default() -> Self {
-        Self {
-            allow_advice: false,
         }
     }
 }
@@ -439,13 +426,12 @@ pub fn validate(spec: &Spec) -> ValidationReport {
                 kind: PatternKind::NameRegex,
                 value,
             } = p
+                && regex::Regex::new(value).is_err()
             {
-                if regex::Regex::new(value).is_err() {
-                    report.errors.push(format!(
-                        "module '{}' has invalid regex pattern: '{}'",
-                        m.name, value
-                    ));
-                }
+                report.errors.push(format!(
+                    "module '{}' has invalid regex pattern: '{}'",
+                    m.name, value
+                ));
             }
         }
     }

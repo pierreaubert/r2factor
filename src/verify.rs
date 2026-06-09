@@ -344,14 +344,30 @@ fn render_tree(out: &mut String, tree: &SplitWriteTree, depth: usize) {
 }
 
 pub fn locate_package_manifest(path: &Path) -> Option<PathBuf> {
-    let mut dir = if path.is_dir() { path } else { path.parent()? };
+    let mut dir = manifest_search_start(path)?;
     loop {
         let manifest = dir.join("Cargo.toml");
         if manifest.is_file() && manifest_has_package(&manifest) {
             return Some(manifest);
         }
-        dir = dir.parent()?;
+        if !dir.pop() {
+            return None;
+        }
     }
+}
+
+fn manifest_search_start(path: &Path) -> Option<PathBuf> {
+    let mut dir = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()?.to_path_buf()
+    };
+    if dir.as_os_str().is_empty() || dir.as_os_str() == "." {
+        dir = std::env::current_dir().ok()?;
+    } else if dir.is_relative() {
+        dir = std::env::current_dir().ok()?.join(dir);
+    }
+    Some(dir)
 }
 
 fn manifest_has_package(manifest: &Path) -> bool {
@@ -452,6 +468,7 @@ mod tests {
     use super::*;
     use crate::pipeline::SplitWriteTree;
     use crate::write::{RemovedFileBackup, WriteReport};
+    use std::sync::{Mutex, OnceLock};
 
     #[test]
     fn locate_package_manifest_finds_nearest_package() {
@@ -474,6 +491,33 @@ mod tests {
 
         assert_eq!(
             locate_package_manifest(&src).as_deref(),
+            Some(expected.as_path())
+        );
+    }
+
+    #[test]
+    fn locate_package_manifest_resolves_relative_file_from_src_dir() {
+        let _lock = current_dir_lock().lock().expect("lock cwd");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let crate_dir = tmp.path().join("crates/app");
+        let src_dir = crate_dir.join("src");
+        std::fs::create_dir_all(&src_dir).expect("mkdir src");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write package manifest");
+        std::fs::write(src_dir.join("lib.rs"), "").expect("write lib");
+        let _cwd = CurrentDirGuard::push(&src_dir);
+        let expected = src_dir
+            .canonicalize()
+            .expect("canonical src dir")
+            .parent()
+            .expect("crate dir")
+            .join("Cargo.toml");
+
+        assert_eq!(
+            locate_package_manifest(Path::new("lib.rs")).as_deref(),
             Some(expected.as_path())
         );
     }
@@ -625,5 +669,28 @@ mod tests {
         let report = fs::read_to_string(reports[0].path()).expect("read bug report");
         assert!(report.contains("Remove proprietary code"), "{report}");
         assert!(report.contains("could not find a Cargo.toml"), "{report}");
+    }
+
+    fn current_dir_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct CurrentDirGuard {
+        original: PathBuf,
+    }
+
+    impl CurrentDirGuard {
+        fn push(dir: &Path) -> Self {
+            let original = std::env::current_dir().expect("current dir");
+            std::env::set_current_dir(dir).expect("set current dir");
+            Self { original }
+        }
+    }
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.original);
+        }
     }
 }

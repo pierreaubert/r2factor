@@ -215,20 +215,11 @@ struct AdvisorEvidenceSummary {
     ambiguous: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct AdvisorReply {
     renames: BTreeMap<String, String>,
     moves: Vec<AdvisorMove>,
-}
-
-impl Default for AdvisorReply {
-    fn default() -> Self {
-        Self {
-            renames: BTreeMap::new(),
-            moves: Vec::new(),
-        }
-    }
 }
 
 #[derive(Debug, Deserialize)]

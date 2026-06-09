@@ -240,10 +240,8 @@ pub fn discover_dir(root: &Path, use_tokensave: bool) -> anyhow::Result<Discover
 
     let mut edges = build_edges(&files, &items);
 
-    if use_tokensave {
-        if let Err(e) = try_enrich_with_tokensave(&files, &items, &mut edges) {
-            eprintln!("[discover] tokensave enrichment failed: {e}");
-        }
+    if use_tokensave && let Err(e) = try_enrich_with_tokensave(&files, &items, &mut edges) {
+        eprintln!("[discover] tokensave enrichment failed: {e}");
     }
 
     Ok(Discovery {
@@ -354,16 +352,14 @@ fn collect_rust_files(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
             let is_file = ft.as_ref().map(|t| t.is_file()).unwrap_or(false);
 
             if is_dir {
-                if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                    if should_skip_dir(name) {
-                        continue;
-                    }
+                if let Some(name) = path.file_name().and_then(|s| s.to_str())
+                    && should_skip_dir(name)
+                {
+                    continue;
                 }
                 stack.push(path);
-            } else if is_file {
-                if path.extension().and_then(|s| s.to_str()) == Some("rs") {
-                    out.push(path);
-                }
+            } else if is_file && path.extension().and_then(|s| s.to_str()) == Some("rs") {
+                out.push(path);
             }
         }
     }
@@ -415,10 +411,10 @@ fn build_edges(files: &[DiscoveredFile], items: &[GlobalItem]) -> Vec<RefEdge> {
                 continue;
             };
             for r in &it.refs {
-                if let Some(&to) = local_name_to_gid.get(r.as_str()) {
-                    if from != to {
-                        edges.push(RefEdge { from, to });
-                    }
+                if let Some(&to) = local_name_to_gid.get(r.as_str())
+                    && from != to
+                {
+                    edges.push(RefEdge { from, to });
                 }
             }
         }
@@ -477,7 +473,7 @@ fn build_edges(files: &[DiscoveredFile], items: &[GlobalItem]) -> Vec<RefEdge> {
     }
 
     // Deduplicate and sort for deterministic output.
-    edges.sort_by(|a, b| (a.from, a.to).cmp(&(b.from, b.to)));
+    edges.sort_by_key(|a| (a.from, a.to));
     edges.dedup_by(|a, b| a.from == b.from && a.to == b.to);
     edges
 }
@@ -524,14 +520,13 @@ fn try_enrich_with_tokensave(
             .map_err(|e| anyhow::anyhow!("get_nodes_by_file: {e}"))?;
 
         for it in &file.items {
-            if let Some(node_id) = crate::tokensave::matching::best_node_for_item(it, &nodes) {
-                if let Some(gid) = items
+            if let Some(node_id) = crate::tokensave::matching::best_node_for_item(it, &nodes)
+                && let Some(gid) = items
                     .iter()
                     .find(|g| g.file_id == file_id && g.local_id == it.id)
                     .map(|g| g.id)
-                {
-                    node_to_global.insert(node_id.clone(), gid);
-                }
+            {
+                node_to_global.insert(node_id.clone(), gid);
             }
         }
     }

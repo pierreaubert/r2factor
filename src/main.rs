@@ -370,7 +370,7 @@ fn main() -> Result<()> {
                 llm_endpoint,
                 llm_model,
                 llm_api_key,
-                json,
+                json: _,
             } => {
                 let spec = r2factor::spec::parse_spec(&spec)?;
                 let path = path.unwrap_or(std::env::current_dir()?);
@@ -388,11 +388,7 @@ fn main() -> Result<()> {
                     mode: RefactorMode::Plan,
                 };
                 let report = r2factor::refactor::refactor_plan(&path, &spec, &opts)?;
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&report)?);
-                } else {
-                    println!("{}", serde_json::to_string_pretty(&report)?);
-                }
+                println!("{}", serde_json::to_string_pretty(&report)?);
                 Ok(())
             }
             RefactorCmd::Preview {
@@ -401,7 +397,7 @@ fn main() -> Result<()> {
                 no_tokensave,
                 no_rg,
                 run_tests,
-                json,
+                json: _,
             } => {
                 let spec = r2factor::spec::parse_spec(&spec)?;
                 let path = path.unwrap_or(std::env::current_dir()?);
@@ -414,11 +410,7 @@ fn main() -> Result<()> {
                     mode: RefactorMode::Preview,
                 };
                 let report = r2factor::refactor::refactor_preview(&path, &spec, &opts)?;
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&report)?);
-                } else {
-                    println!("{}", serde_json::to_string_pretty(&report)?);
-                }
+                println!("{}", serde_json::to_string_pretty(&report)?);
                 Ok(())
             }
             RefactorCmd::Write {
@@ -428,7 +420,7 @@ fn main() -> Result<()> {
                 no_rg,
                 confirm,
                 run_tests,
-                json,
+                json: _,
             } => {
                 if !confirm {
                     anyhow::bail!("refactor write requires --confirm");
@@ -444,20 +436,12 @@ fn main() -> Result<()> {
                     mode: RefactorMode::Write,
                 };
                 let report = r2factor::refactor::refactor_write(&path, &spec, &opts)?;
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&report)?);
-                } else {
-                    println!("{}", serde_json::to_string_pretty(&report)?);
-                }
+                println!("{}", serde_json::to_string_pretty(&report)?);
                 Ok(())
             }
-            RefactorCmd::Rollback { manifest, json } => {
+            RefactorCmd::Rollback { manifest, json: _ } => {
                 let report = r2factor::refactor::refactor_rollback_manifest(&manifest)?;
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&report)?);
-                } else {
-                    println!("{}", serde_json::to_string_pretty(&report)?);
-                }
+                println!("{}", serde_json::to_string_pretty(&report)?);
                 Ok(())
             }
         },

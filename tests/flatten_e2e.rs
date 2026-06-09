@@ -11,6 +11,7 @@ fn split_in_tempdir(stem: &str, src: &str) -> (tempfile::TempDir, PathBuf) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let f = tmp.path().join(format!("{stem}.rs"));
     fs::write(&f, src).expect("write src");
+    fs::write(tmp.path().join("README.md"), "fixture sibling\n").expect("write sibling");
     run_split(
         &f,
         SplitOptions {

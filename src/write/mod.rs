@@ -93,30 +93,41 @@ impl SplitLayout {
             .ok_or_else(|| anyhow!("invalid file stem in {}", original.display()))?;
 
         match file_name {
-            "main.rs" => Ok(Self {
-                primary_bucket: "main".to_string(),
-                target_dir: parent.join("main"),
-                facade_path_prefix: Some("main".to_string()),
-                exclude_existing_file: None,
-                remove_target_dir_if_empty: true,
-                keep_main_in_facade: true,
-            }),
+            "main.rs" => {
+                let in_place = should_split_in_place(parent, original, "main");
+                Ok(Self {
+                    primary_bucket: "main".to_string(),
+                    target_dir: if in_place {
+                        parent.to_path_buf()
+                    } else {
+                        parent.join("main")
+                    },
+                    facade_path_prefix: if in_place {
+                        None
+                    } else {
+                        Some("main".to_string())
+                    },
+                    exclude_existing_file: in_place.then(|| original.to_path_buf()),
+                    remove_target_dir_if_empty: !in_place,
+                    keep_main_in_facade: true,
+                })
+            }
             "lib.rs" => {
-                let isolated = is_isolated_lib_rs(parent, original);
+                let in_place = should_split_in_place(parent, original, "lib");
                 Ok(Self {
                     primary_bucket: "lib".to_string(),
-                    target_dir: if isolated {
+                    target_dir: if in_place {
                         parent.to_path_buf()
                     } else {
                         parent.join("lib")
                     },
-                    facade_path_prefix: if isolated {
+                    facade_path_prefix: if in_place {
                         None
                     } else {
                         Some("lib".to_string())
                     },
-                    exclude_existing_file: isolated.then(|| original.to_path_buf()),
-                    remove_target_dir_if_empty: !isolated,
+                    exclude_existing_file: in_place.then(|| original.to_path_buf()),
+                    remove_target_dir_if_empty: !in_place,
                     keep_main_in_facade: false,
                 })
             }
@@ -133,15 +144,26 @@ impl SplitLayout {
                     keep_main_in_facade: false,
                 })
             }
-            _ => Ok(Self {
-                primary_bucket: stem.to_string(),
-                target_dir: parent.join(stem),
-                facade_path_prefix: is_cargo_crate_root_like(parent, file_name)
-                    .then(|| stem.to_string()),
-                exclude_existing_file: None,
-                remove_target_dir_if_empty: true,
-                keep_main_in_facade: is_binary_crate_root_like(parent, file_name),
-            }),
+            _ => {
+                let in_place = should_split_in_place(parent, original, stem);
+                let crate_root_like = is_cargo_crate_root_like(parent, file_name);
+                Ok(Self {
+                    primary_bucket: stem.to_string(),
+                    target_dir: if in_place {
+                        parent.to_path_buf()
+                    } else {
+                        parent.join(stem)
+                    },
+                    facade_path_prefix: if in_place {
+                        (!crate_root_like).then(String::new)
+                    } else {
+                        crate_root_like.then(|| stem.to_string())
+                    },
+                    exclude_existing_file: in_place.then(|| original.to_path_buf()),
+                    remove_target_dir_if_empty: !in_place,
+                    keep_main_in_facade: is_binary_crate_root_like(parent, file_name),
+                })
+            }
         }
     }
 
@@ -178,23 +200,26 @@ fn is_cargo_crate_root_like(parent: &Path, file_name: &str) -> bool {
     )
 }
 
-fn is_isolated_lib_rs(parent: &Path, original: &Path) -> bool {
+fn should_split_in_place(parent: &Path, original: &Path, target_dir_name: &str) -> bool {
+    !parent.join(target_dir_name).is_dir() && directory_contains_only_target_file(parent, original)
+}
+
+fn directory_contains_only_target_file(parent: &Path, original: &Path) -> bool {
     let Ok(entries) = fs::read_dir(parent) else {
         return false;
     };
+    let mut saw_original = false;
     for entry in entries.flatten() {
         let path = entry.path();
-        if same_path(&path, original) {
-            continue;
-        }
-        if path.is_dir() && path.file_name().is_some_and(|name| name == "lib") {
-            return false;
-        }
-        if path.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
-            return false;
+        if path.is_file() {
+            if same_path(&path, original) {
+                saw_original = true;
+            } else {
+                return false;
+            }
         }
     }
-    true
+    saw_original
 }
 
 pub fn write_plan(
@@ -977,12 +1002,11 @@ fn top_level_item_import(item: &syn::Item) -> Option<(String, Vec<String>)> {
 }
 
 fn cfg_attrs_from_attrs(attrs: &[syn::Attribute]) -> Vec<String> {
-    let cfg_attrs = attrs
+    attrs
         .iter()
         .filter(|attr| attr.path().is_ident("cfg"))
         .map(|attr| attr.to_token_stream().to_string())
-        .collect();
-    cfg_attrs
+        .collect()
 }
 
 fn is_visible_from_descendant(vis: &syn::Visibility) -> bool {
@@ -1053,10 +1077,8 @@ fn module_has_reexportable_items(ids: &[ItemId], by_id: &BTreeMap<ItemId, &Parse
 fn external_mod_decl_attrs(by_id: &BTreeMap<ItemId, &ParsedItem>) -> BTreeMap<String, Vec<String>> {
     by_id
         .values()
-        .filter_map(|item| {
-            item.is_external_mod_decl()
-                .then(|| (item.name.clone(), cfg_attrs_of(&item.source)))
-        })
+        .filter(|item| item.is_external_mod_decl())
+        .map(|item| (item.name.clone(), cfg_attrs_of(&item.source)))
         .collect()
 }
 

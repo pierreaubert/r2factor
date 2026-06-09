@@ -399,7 +399,7 @@ fn apply_edits(
         return (src.to_string(), 0, warnings);
     }
 
-    edits.sort_by(|a, b| (a.start, a.end).cmp(&(b.start, b.end)));
+    edits.sort_by_key(|a| (a.start, a.end));
     edits.dedup_by(|a, b| a.start == b.start && a.end == b.end && a.replacement == b.replacement);
 
     // Detect overlapping edits and skip them with a warning.
