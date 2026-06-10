@@ -1,8 +1,9 @@
 use crate::item::{ItemId, ItemKind, ParsedItem};
 use crate::promote::{
-    CrossImport, add_pub_super, add_pub_super_to_fields, lift_impl_methods,
+    CrossImport, add_pub_crate, add_pub_super, add_pub_super_to_fields, lift_impl_methods,
     rebase_body_super_for_subfile, rebase_pub_super_in_subfile,
 };
+use crate::write::proc_macro_entry;
 use crate::write::uses;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write;
@@ -22,6 +23,7 @@ pub fn render_sub_file(
     by_id: &BTreeMap<ItemId, &ParsedItem>,
     use_prelude: &str,
     promote: &BTreeSet<ItemId>,
+    crate_promote: &BTreeSet<ItemId>,
     impl_lifts: &BTreeSet<ItemId>,
     field_lifts: &BTreeSet<ItemId>,
     imports: &BTreeSet<CrossImport>,
@@ -76,7 +78,9 @@ pub fn render_sub_file(
         //    such as inherent impl methods and struct fields, while keeping
         //    newly introduced `pub(super)` lifts scoped to the facade.
         let original_scope_rebased = rebase_pub_super_in_subfile(&it.source);
-        let after_vis = if promote.contains(&id) {
+        let after_vis = if crate_promote.contains(&id) {
+            add_pub_crate(&original_scope_rebased)
+        } else if promote.contains(&id) {
             // `add_pub_super` handles both keyword AND fields, so skip the
             // separate field lift below for this branch.
             add_pub_super(&original_scope_rebased)
@@ -103,6 +107,9 @@ pub fn render_sub_file(
         final_src = uses::rebase_local_module_paths_in_source(&final_src, local_module_roots);
         if let Some(prefix) = include_path_prefix {
             final_src = rebase_include_macro_paths(&final_src, prefix);
+        }
+        if let Some(impl_src) = proc_macro_entry::implementation_source(&final_src) {
+            final_src = impl_src;
         }
         if matches!(it.kind, ItemKind::Mod) && it.name != module {
             final_src = add_bucket_scope_import_to_inline_module(&final_src);
@@ -249,6 +256,7 @@ mod tests {
             &[item.id],
             &by_id,
             "use super::helper;",
+            &BTreeSet::new(),
             &BTreeSet::new(),
             &BTreeSet::new(),
             &BTreeSet::new(),

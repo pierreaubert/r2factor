@@ -5,6 +5,8 @@
 //! framing).
 
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 const BIN: &str = env!("CARGO_BIN_EXE_r2factor");
@@ -17,15 +19,22 @@ struct McpSession {
 
 impl McpSession {
     fn start() -> Self {
-        let mut child = Command::new(BIN)
+        Self::start_with_env([])
+    }
+
+    fn start_with_env<const N: usize>(envs: [(&str, String); N]) -> Self {
+        let mut command = Command::new(BIN);
+        command
             .arg("mcp")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // Drain stderr so the test process doesn't block on a full
             // pipe; the protocol stream is stdout only.
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn r2factor mcp");
+            .stderr(Stdio::null());
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        let mut child = command.spawn().expect("spawn r2factor mcp");
         let stdin = child.stdin.take().expect("stdin");
         let stdout = BufReader::new(child.stdout.take().expect("stdout"));
         Self {
@@ -48,6 +57,34 @@ impl McpSession {
             .expect("read response");
         serde_json::from_str(resp_line.trim()).expect("decode response")
     }
+}
+
+#[cfg(unix)]
+fn write_fake_cargo(bin_dir: &std::path::Path) -> std::path::PathBuf {
+    write_fake_cargo_script(
+        bin_dir,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$R2FACTOR_FAKE_CARGO_LOG\"\n",
+    )
+}
+
+#[cfg(unix)]
+fn write_failing_fake_cargo(bin_dir: &std::path::Path) -> std::path::PathBuf {
+    write_fake_cargo_script(
+        bin_dir,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$R2FACTOR_FAKE_CARGO_LOG\"\nprintf 'synthetic cargo failure\\n' >&2\nexit 1\n",
+    )
+}
+
+#[cfg(unix)]
+fn write_fake_cargo_script(bin_dir: &std::path::Path, script: &str) -> std::path::PathBuf {
+    let cargo = bin_dir.join("cargo");
+    std::fs::write(&cargo, script).expect("write fake cargo");
+    let mut perms = std::fs::metadata(&cargo)
+        .expect("fake cargo metadata")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&cargo, perms).expect("chmod fake cargo");
+    cargo
 }
 
 impl Drop for McpSession {
@@ -74,6 +111,13 @@ fn tool_data(resp: &serde_json::Value) -> serde_json::Value {
     assert_eq!(payload["ok"], true);
     assert_eq!(payload["format"], "json");
     payload["data"].clone()
+}
+
+fn tool_error(resp: &serde_json::Value) -> serde_json::Value {
+    assert_eq!(resp["result"]["isError"], true);
+    let payload = tool_payload(resp);
+    assert_eq!(payload["ok"], false);
+    payload
 }
 
 #[test]
@@ -124,6 +168,122 @@ fn tools_list_advertises_available_tools() {
             t["name"]
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn split_write_tool_runs_cargo_verification_for_package_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src_dir = tmp.path().join("src");
+    std::fs::create_dir_all(&src_dir).expect("mkdir src");
+    std::fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .expect("write manifest");
+    let lib = src_dir.join("lib.rs");
+    std::fs::write(
+        &lib,
+        "pub struct Alpha;\npub struct Beta;\npub struct Gamma;\n",
+    )
+    .expect("write lib");
+    let fake_bin = tmp.path().join("fake-bin");
+    std::fs::create_dir_all(&fake_bin).expect("mkdir fake bin");
+    write_fake_cargo(&fake_bin);
+    let log = tmp.path().join("cargo.log");
+    let path = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let mut sess = McpSession::start_with_env([
+        ("PATH", path),
+        ("R2FACTOR_FAKE_CARGO_LOG", log.display().to_string()),
+    ]);
+    let resp = sess.request(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "split_write",
+            "arguments": {
+                "file": lib,
+                "use_tokensave": false,
+                "max_lines": 0
+            },
+        },
+    }));
+
+    assert!(resp["result"]["isError"].is_null(), "{resp:#}");
+    let _tree = tool_data(&resp);
+    let log = std::fs::read_to_string(&log).expect("read fake cargo log");
+    assert!(log.contains("check --manifest-path"), "log:\n{log}");
+    assert!(log.contains("clippy --manifest-path"), "log:\n{log}");
+}
+
+#[cfg(unix)]
+#[test]
+fn split_write_tool_writes_bug_report_when_cargo_verification_fails() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src_dir = tmp.path().join("src");
+    std::fs::create_dir_all(&src_dir).expect("mkdir src");
+    std::fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .expect("write manifest");
+    let lib = src_dir.join("lib.rs");
+    std::fs::write(
+        &lib,
+        "pub struct Alpha;\npub struct Beta;\npub struct Gamma;\n",
+    )
+    .expect("write lib");
+    let fake_bin = tmp.path().join("fake-bin");
+    std::fs::create_dir_all(&fake_bin).expect("mkdir fake bin");
+    write_failing_fake_cargo(&fake_bin);
+    let log = tmp.path().join("cargo.log");
+    let path = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let mut sess = McpSession::start_with_env([
+        ("PATH", path),
+        ("R2FACTOR_FAKE_CARGO_LOG", log.display().to_string()),
+    ]);
+    let resp = sess.request(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "split_write",
+            "arguments": {
+                "file": lib,
+                "use_tokensave": false,
+                "max_lines": 0
+            },
+        },
+    }));
+
+    let payload = tool_error(&resp);
+    let err = payload["error"].as_str().expect("error text");
+    assert!(err.contains("bug report ->"), "{err}");
+    let report_dir = tmp.path().join(".r2factor/bug-reports");
+    let reports = std::fs::read_dir(&report_dir)
+        .expect("bug report dir")
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .expect("bug report entries");
+    assert_eq!(reports.len(), 1);
+    let report = std::fs::read_to_string(reports[0].path()).expect("read bug report");
+    assert!(report.contains("synthetic cargo failure"), "{report}");
+    assert!(report.contains("## Split Tree"), "{report}");
+    assert!(
+        std::fs::read_to_string(&lib)
+            .expect("read restored lib")
+            .contains("pub struct Alpha;")
+    );
 }
 
 #[test]

@@ -50,15 +50,11 @@ pub struct SplitVerifyFailureReport {
 }
 
 pub fn verify_split_with_cargo(file: &Path) -> Result<CargoVerifyReport> {
-    run_cargo_verification(file).map_err(|failure| anyhow!("{failure}"))
-}
-
-pub fn verify_split_with_rollback(file: &Path, tree: &SplitWriteTree) -> Result<CargoVerifyReport> {
     match run_cargo_verification(file) {
         Ok(report) => Ok(report),
         Err(failure) => {
-            let rollback = rollback_split_tree(tree);
-            let bug_report = match write_bug_report(file, tree, &failure, &rollback) {
+            let rollback = SplitRollbackReport::default();
+            let bug_report = match write_bug_report(file, None, &failure, &rollback) {
                 Ok(path) => {
                     eprintln!("[verify] bug report -> {}", path.display());
                     path
@@ -68,23 +64,85 @@ pub fn verify_split_with_rollback(file: &Path, tree: &SplitWriteTree) -> Result<
                     PathBuf::new()
                 }
             };
-            eprintln!(
-                "[verify] rolled back split: {} restored, {} removed, {} error(s)",
-                rollback.restored_files.len(),
-                rollback.removed_files.len(),
-                rollback.errors.len()
-            );
             if bug_report.as_os_str().is_empty() {
-                Err(anyhow!(
-                    "{failure}\n[verify] split was rolled back, but bug report generation failed"
-                ))
+                Err(anyhow!("{failure}\n[verify] bug report generation failed"))
             } else {
                 Err(anyhow!(
-                    "{failure}\n[verify] split was rolled back; bug report -> {}",
+                    "{failure}\n[verify] bug report -> {}",
                     bug_report.display()
                 ))
             }
         }
+    }
+}
+
+pub fn verify_split_with_rollback(file: &Path, tree: &SplitWriteTree) -> Result<CargoVerifyReport> {
+    match run_cargo_verification(file) {
+        Ok(report) => Ok(report),
+        Err(failure) => fail_with_rollback_report(file, std::slice::from_ref(tree), *failure),
+    }
+}
+
+pub fn fail_with_rollback_report(
+    file: &Path,
+    trees: &[SplitWriteTree],
+    failure: CargoVerifyFailure,
+) -> Result<CargoVerifyReport> {
+    let failure_text = failure.to_string();
+    let reports = fail_with_rollback_reports(file, trees, vec![failure])?;
+    Err(anyhow!(
+        "{failure_text}\n[verify] split was rolled back; bug report -> {}",
+        reports
+            .bug_reports
+            .first()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<failed>".to_string())
+    ))
+}
+
+#[derive(Debug, Clone)]
+pub struct SplitVerifyFailureReports {
+    pub bug_reports: Vec<PathBuf>,
+    pub rollback: SplitRollbackReport,
+}
+
+pub fn fail_with_rollback_reports(
+    file: &Path,
+    trees: &[SplitWriteTree],
+    failures: Vec<CargoVerifyFailure>,
+) -> Result<SplitVerifyFailureReports> {
+    let rollback = rollback_split_trees(trees);
+    eprintln!(
+        "[verify] rolled back split: {} restored, {} removed, {} error(s)",
+        rollback.restored_files.len(),
+        rollback.removed_files.len(),
+        rollback.errors.len()
+    );
+    let mut bug_reports = Vec::new();
+    let mut report_errors = Vec::new();
+    for failure in &failures {
+        match write_bug_report(file, Some(trees), failure, &rollback) {
+            Ok(path) => {
+                eprintln!("[verify] bug report -> {}", path.display());
+                bug_reports.push(path);
+            }
+            Err(err) => {
+                eprintln!("[verify] failed to write bug report: {err}");
+                report_errors.push(err.to_string());
+            }
+        }
+    }
+    if bug_reports.is_empty() {
+        Err(anyhow!(
+            "post-split verification failed for {} command(s)\n[verify] split was rolled back, but bug report generation failed: {}",
+            failures.len(),
+            report_errors.join("; ")
+        ))
+    } else {
+        Ok(SplitVerifyFailureReports {
+            bug_reports,
+            rollback,
+        })
     }
 }
 
@@ -139,16 +197,33 @@ fn run_cargo_verification(
 }
 
 pub fn rollback_split_tree(tree: &SplitWriteTree) -> SplitRollbackReport {
+    rollback_split_trees(std::slice::from_ref(tree))
+}
+
+pub fn rollback_split_trees(trees: &[SplitWriteTree]) -> SplitRollbackReport {
     let mut report = SplitRollbackReport::default();
-    rollback_tree_inner(tree, &mut report);
+    for tree in trees.iter().rev() {
+        rollback_tree_inner(tree, &mut report);
+    }
     report
 }
 
 fn rollback_tree_inner(tree: &SplitWriteTree, rollback: &mut SplitRollbackReport) {
     for child in tree.children.iter().rev() {
         rollback_tree_inner(child, rollback);
+        remove_generated_child_backup(&child.report.backup, rollback);
     }
     rollback_write_report(&tree.report, rollback);
+}
+
+fn remove_generated_child_backup(path: &Path, rollback: &mut SplitRollbackReport) {
+    match fs::remove_file(path) {
+        Ok(()) => rollback.removed_files.push(path.to_path_buf()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => rollback
+            .errors
+            .push(format!("remove generated backup {}: {err}", path.display())),
+    }
 }
 
 fn rollback_write_report(report: &WriteReport, rollback: &mut SplitRollbackReport) {
@@ -202,14 +277,14 @@ fn rollback_write_report(report: &WriteReport, rollback: &mut SplitRollbackRepor
 
 fn write_bug_report(
     file: &Path,
-    tree: &SplitWriteTree,
+    trees: Option<&[SplitWriteTree]>,
     failure: &CargoVerifyFailure,
     rollback: &SplitRollbackReport,
 ) -> Result<PathBuf> {
     let dir = bug_report_dir(file, failure);
     fs::create_dir_all(&dir)?;
     let path = unique_bug_report_path(&dir)?;
-    fs::write(&path, render_bug_report(file, tree, failure, rollback))?;
+    fs::write(&path, render_bug_report(file, trees, failure, rollback))?;
     Ok(path)
 }
 
@@ -248,7 +323,7 @@ fn unique_bug_report_path(dir: &Path) -> Result<PathBuf> {
 
 fn render_bug_report(
     file: &Path,
-    tree: &SplitWriteTree,
+    trees: Option<&[SplitWriteTree]>,
     failure: &CargoVerifyFailure,
     rollback: &SplitRollbackReport,
 ) -> String {
@@ -304,7 +379,17 @@ fn render_bug_report(
     }
     let _ = writeln!(out);
     let _ = writeln!(out, "## Split Tree");
-    render_tree(&mut out, tree, 0);
+    if let Some(trees) = trees {
+        for tree in trees {
+            render_tree(&mut out, tree, 0);
+        }
+    } else {
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "- not available; verification ran without a split write tree"
+        );
+    }
     let _ = writeln!(out);
     let _ = writeln!(out, "## Stdout");
     let _ = writeln!(out);
@@ -413,6 +498,24 @@ impl CargoInvocation {
 }
 
 impl CargoVerifyFailure {
+    pub(crate) fn for_command_output(
+        manifest: Option<PathBuf>,
+        completed: Vec<CargoVerifyCommand>,
+        argv: Vec<String>,
+        output: Output,
+    ) -> Self {
+        Self {
+            manifest,
+            completed,
+            failed: CargoVerifyFailedCommand {
+                argv,
+                status: output.status.to_string(),
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            },
+        }
+    }
+
     fn for_output(
         manifest: PathBuf,
         completed: Vec<CargoVerifyCommand>,
@@ -431,7 +534,7 @@ impl CargoVerifyFailure {
         }
     }
 
-    fn for_launch_error(
+    pub(crate) fn for_launch_error(
         manifest: Option<PathBuf>,
         completed: Vec<CargoVerifyCommand>,
         argv: Vec<String>,
@@ -669,6 +772,29 @@ mod tests {
         let report = fs::read_to_string(reports[0].path()).expect("read bug report");
         assert!(report.contains("Remove proprietary code"), "{report}");
         assert!(report.contains("could not find a Cargo.toml"), "{report}");
+    }
+
+    #[test]
+    fn verify_cargo_failure_without_tree_writes_bug_report() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let facade = tmp.path().join("foo.rs");
+        fs::write(&facade, "pub struct Foo;\n").expect("write facade");
+
+        let err = verify_split_with_cargo(&facade).expect_err("verification fails");
+
+        assert!(err.to_string().contains("bug report ->"), "{err}");
+        let report_dir = tmp.path().join(".r2factor/bug-reports");
+        let reports = fs::read_dir(&report_dir)
+            .expect("bug report dir")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("bug report entries");
+        assert_eq!(reports.len(), 1);
+        let report = fs::read_to_string(reports[0].path()).expect("read bug report");
+        assert!(report.contains("could not find a Cargo.toml"), "{report}");
+        assert!(
+            report.contains("verification ran without a split write tree"),
+            "{report}"
+        );
     }
 
     fn current_dir_lock() -> &'static Mutex<()> {

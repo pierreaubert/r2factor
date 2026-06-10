@@ -5,14 +5,15 @@
 mod backup;
 mod facade;
 mod preamble;
+mod proc_macro_entry;
 mod subfile;
 mod uses;
 
-use crate::item::{ItemId, ItemKind, ParsedItem};
+use crate::item::{ItemId, ItemKind, ItemVis, ParsedItem};
 use crate::plan::Plan;
 use crate::promote::{
     CrossImport, RefContext, cfg_attrs_of, compute_cross_imports, compute_facade_imports,
-    compute_field_lifts, compute_impl_lifts, compute_promotions,
+    compute_field_lifts, compute_impl_lifts, compute_promotions, needs_keyword_rewrite,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use quote::ToTokens;
@@ -266,7 +267,7 @@ pub fn write_plan(
     // still resolve after the lift. All three derived from one shared
     // `RefContext` so we don't rebuild the lookup maps three times.
     let ctx = RefContext::new(plan, items);
-    let promote: BTreeSet<ItemId> = compute_promotions(&ctx, items, stem);
+    let mut promote: BTreeSet<ItemId> = compute_promotions(&ctx, items, stem);
     let cross_imports = compute_cross_imports(&ctx, items, &promote, stem);
     let facade_imports = compute_facade_imports(&ctx, items, &promote, stem);
     // Inherent-impl blocks for promoted types: rewrite associated items
@@ -287,6 +288,14 @@ pub fn write_plan(
     let assignments = rename_assignments(&plan.assignments, &renames);
     let cross_imports = rename_cross_imports(cross_imports, &renames);
     let facade_imports = rename_facade_imports(facade_imports, &renames);
+    let (crate_promote, crate_root_imports) = external_crate_root_imports(
+        original,
+        &assignments,
+        &by_id,
+        stem,
+        &explicit_external_modules,
+    );
+    let proc_macro_exports = proc_macro_exports(&assignments, &by_id, stem);
 
     // Only files that the plan actually materialises can conflict.
     let planned_files: BTreeSet<String> = assignments
@@ -298,6 +307,13 @@ pub fn write_plan(
     let included_facade_items = included_facade_items(original, items);
     let macro_defined_names = macro_defined_names_by_source(&assignments, &by_id, stem);
     let trait_method_imports = trait_method_imports_by_method(&assignments, &by_id, stem);
+    add_trait_method_promotions(
+        &mut promote,
+        &assignments,
+        &by_id,
+        stem,
+        &trait_method_imports,
+    );
     let parent_generated_items = parent_generated_sibling_items(original);
 
     // Determine which .rs files already live in the target directory so we
@@ -491,6 +507,7 @@ pub fn write_plan(
             &by_id,
             &bucket_prelude,
             &promote,
+            &crate_promote,
             &impl_lifts,
             &field_lifts,
             &imports,
@@ -533,6 +550,8 @@ pub fn write_plan(
         &sub_modules,
         &reexport_modules,
         layout.facade_path_prefix.as_deref(),
+        &proc_macro_exports,
+        &crate_root_imports,
         &promote,
         &impl_lifts,
         &facade_imports,
@@ -632,6 +651,153 @@ fn included_facade_items(original: &Path, items: &[ParsedItem]) -> BTreeMap<Stri
     out.into_iter()
         .filter_map(|(name, cfg_attrs)| cfg_attrs.map(|cfg_attrs| (name, cfg_attrs)))
         .collect()
+}
+
+fn external_crate_root_imports(
+    original: &Path,
+    assignments: &BTreeMap<String, Vec<ItemId>>,
+    by_id: &BTreeMap<ItemId, &ParsedItem>,
+    stem: &str,
+    explicit_external_modules: &BTreeSet<String>,
+) -> (BTreeSet<ItemId>, BTreeSet<CrossImport>) {
+    let refs = external_module_crate_root_refs(original, by_id);
+    if refs.is_empty() {
+        return (BTreeSet::new(), BTreeSet::new());
+    }
+    let module_names: BTreeSet<String> = assignments
+        .keys()
+        .filter(|module| module.as_str() != "mod_root" && module.as_str() != stem)
+        .cloned()
+        .chain(explicit_external_modules.iter().cloned())
+        .collect();
+    let mut promote = BTreeSet::new();
+    let mut imports = BTreeSet::new();
+    for (module, ids) in assignments {
+        if module == "mod_root" || module == stem {
+            continue;
+        }
+        for id in ids {
+            let item = by_id[id];
+            if item.name.is_empty()
+                || module_names.contains(item.name.as_str())
+                || !refs.contains(item.name.as_str())
+                || item.vis != ItemVis::Private
+                || !needs_keyword_rewrite(item)
+            {
+                continue;
+            }
+            promote.insert(*id);
+            imports.insert(CrossImport {
+                source_bucket: Some(module.clone()),
+                name: item.name.clone(),
+                cfg_attrs: cfg_attrs_of(&item.source),
+            });
+        }
+    }
+    (promote, imports)
+}
+
+fn external_module_crate_root_refs(
+    original: &Path,
+    by_id: &BTreeMap<ItemId, &ParsedItem>,
+) -> BTreeSet<String> {
+    let mut refs = BTreeSet::new();
+    for path in external_module_paths(original, by_id) {
+        let Ok(source) = fs::read_to_string(&path) else {
+            continue;
+        };
+        refs.extend(crate_root_refs_in_source(&source));
+    }
+    refs
+}
+
+fn external_module_paths(original: &Path, by_id: &BTreeMap<ItemId, &ParsedItem>) -> Vec<PathBuf> {
+    let Some(parent) = original.parent() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in by_id.values().filter(|item| item.is_external_mod_decl()) {
+        let Ok(syn::Item::Mod(module)) = syn::parse_str::<syn::Item>(&item.source) else {
+            continue;
+        };
+        if let Some(path) = module
+            .attrs
+            .iter()
+            .find(|attr| attr.path().is_ident("path"))
+            .and_then(|attr| attr.parse_args::<syn::LitStr>().ok())
+            .map(|lit| parent.join(lit.value()))
+        {
+            out.push(path);
+            continue;
+        }
+        let file = parent.join(format!("{}.rs", item.name));
+        if file.is_file() {
+            out.push(file);
+            continue;
+        }
+        let mod_file = parent.join(&item.name).join("mod.rs");
+        if mod_file.is_file() {
+            out.push(mod_file);
+        }
+    }
+    out
+}
+
+fn crate_root_refs_in_source(source: &str) -> BTreeSet<String> {
+    let Ok(file) = syn::parse_file(source) else {
+        return BTreeSet::new();
+    };
+    let mut visitor = CrateRootRefVisitor {
+        refs: BTreeSet::new(),
+    };
+    syn::visit::Visit::visit_file(&mut visitor, &file);
+    visitor.refs
+}
+
+struct CrateRootRefVisitor {
+    refs: BTreeSet<String>,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for CrateRootRefVisitor {
+    fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+        collect_crate_use_tree(&item.tree, false, &mut self.refs);
+    }
+
+    fn visit_path(&mut self, path: &'ast syn::Path) {
+        let mut segments = path.segments.iter();
+        if segments
+            .next()
+            .is_some_and(|segment| segment.ident == "crate")
+            && let Some(segment) = segments.next()
+        {
+            self.refs.insert(segment.ident.to_string());
+        }
+        syn::visit::visit_path(self, path);
+    }
+}
+
+fn collect_crate_use_tree(tree: &syn::UseTree, under_crate: bool, refs: &mut BTreeSet<String>) {
+    match tree {
+        syn::UseTree::Path(path) if path.ident == "crate" && !under_crate => {
+            collect_crate_use_tree(path.tree.as_ref(), true, refs);
+        }
+        syn::UseTree::Path(path) if under_crate => {
+            refs.insert(path.ident.to_string());
+        }
+        syn::UseTree::Path(path) => collect_crate_use_tree(path.tree.as_ref(), false, refs),
+        syn::UseTree::Name(name) if under_crate => {
+            refs.insert(name.ident.to_string());
+        }
+        syn::UseTree::Rename(rename) if under_crate => {
+            refs.insert(rename.ident.to_string());
+        }
+        syn::UseTree::Group(group) => {
+            for item in &group.items {
+                collect_crate_use_tree(item, under_crate, refs);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Pick the subset of `all_uses` that the bucket actually references and
@@ -787,6 +953,7 @@ struct ParentGeneratedItemImport {
 struct TraitMethodImport {
     source_bucket: Option<String>,
     name: String,
+    item_id: ItemId,
     cfg_attrs: Vec<String>,
 }
 
@@ -849,6 +1016,7 @@ fn trait_method_imports_by_method(
             let import = TraitMethodImport {
                 source_bucket: source_bucket.clone(),
                 name: item.name.clone(),
+                item_id: item.id,
                 cfg_attrs: cfg_attrs_of(&item.source),
             };
             for method in methods {
@@ -857,6 +1025,39 @@ fn trait_method_imports_by_method(
         }
     }
     out
+}
+
+fn add_trait_method_promotions(
+    promote: &mut BTreeSet<ItemId>,
+    assignments: &BTreeMap<String, Vec<ItemId>>,
+    by_id: &BTreeMap<ItemId, &ParsedItem>,
+    stem: &str,
+    trait_method_imports: &BTreeMap<String, Vec<TraitMethodImport>>,
+) {
+    for (bucket, ids) in assignments {
+        if bucket == "mod_root" || bucket == stem {
+            continue;
+        }
+        let Some(idents) = uses::bucket_idents_for(ids, by_id) else {
+            continue;
+        };
+        for method in idents {
+            let Some(candidates) = trait_method_imports.get(&method) else {
+                continue;
+            };
+            for candidate in candidates {
+                if candidate.source_bucket.as_deref() == Some(bucket)
+                    || candidate.source_bucket.is_none()
+                {
+                    continue;
+                }
+                let item = by_id[&candidate.item_id];
+                if item.vis == ItemVis::Private && needs_keyword_rewrite(item) {
+                    promote.insert(candidate.item_id);
+                }
+            }
+        }
+    }
 }
 
 fn trait_method_names(source: &str) -> Vec<String> {
@@ -1069,8 +1270,10 @@ fn bucket_known_names(
 
 fn module_has_reexportable_items(ids: &[ItemId], by_id: &BTreeMap<ItemId, &ParsedItem>) -> bool {
     ids.iter().any(|id| {
-        by_id[id].vis != crate::item::ItemVis::Private
-            || matches!(by_id[id].kind, ItemKind::ForeignMod)
+        let item = by_id[id];
+        !proc_macro_entry::is_proc_macro_entry(item)
+            && (item.vis != crate::item::ItemVis::Private
+                || matches!(item.kind, ItemKind::ForeignMod))
     })
 }
 
@@ -1268,6 +1471,28 @@ fn rename_assignments(
     out
 }
 
+fn proc_macro_exports(
+    assignments: &BTreeMap<String, Vec<ItemId>>,
+    by_id: &BTreeMap<ItemId, &ParsedItem>,
+    stem: &str,
+) -> Vec<String> {
+    let mut exports = Vec::new();
+    for (module, ids) in assignments {
+        if module == "mod_root" || module == stem {
+            continue;
+        }
+        for id in ids {
+            let item = by_id[id];
+            if proc_macro_entry::is_proc_macro_entry(item)
+                && let Some(wrapper) = proc_macro_entry::wrapper_source(&item.source, module)
+            {
+                exports.push(wrapper);
+            }
+        }
+    }
+    exports
+}
+
 fn force_facade_pinned_items(
     plan: &Plan,
     items: &[ParsedItem],
@@ -1287,6 +1512,8 @@ fn force_facade_pinned_items(
                 && matches!(item.kind, ItemKind::Fn { .. })
             {
                 adjusted.assign(stem, *id, "crate-root main stays in facade");
+            } else if matches!(item.kind, ItemKind::ExternCrate) {
+                adjusted.assign("mod_root", *id, "extern crate declaration stays in facade");
             } else if is_macro_rules_definition(item) {
                 adjusted.assign(
                     "mod_root",

@@ -146,6 +146,7 @@ fn scan_macro_tokens(stream: &proc_macro2::TokenStream, v: &mut IdentCollector) 
         match tt {
             TokenTree::Ident(id) => v.visit_ident(&id),
             TokenTree::Group(g) => scan_macro_tokens(&g.stream(), v),
+            TokenTree::Literal(lit) => scan_macro_string_literal(&lit, v),
             _ => {}
         }
     }
@@ -161,6 +162,54 @@ fn scan_attr_tokens(stream: &proc_macro2::TokenStream, v: &mut IdentCollector) {
             _ => {}
         }
     }
+}
+
+fn scan_macro_string_literal(lit: &proc_macro2::Literal, v: &mut IdentCollector) {
+    let Ok(lit) = syn::parse_str::<syn::LitStr>(&lit.to_string()) else {
+        return;
+    };
+    collect_format_string_captures(&lit.value(), v);
+}
+
+fn collect_format_string_captures(value: &str, v: &mut IdentCollector) {
+    let mut chars = value.char_indices().peekable();
+    while let Some((_, ch)) = chars.next() {
+        if ch != '{' {
+            continue;
+        }
+        if matches!(chars.peek(), Some((_, '{'))) {
+            chars.next();
+            continue;
+        }
+        while matches!(chars.peek(), Some((_, ch)) if ch.is_whitespace()) {
+            chars.next();
+        }
+        let Some((_, first)) = chars.peek().copied() else {
+            continue;
+        };
+        if !is_ident_start(first) {
+            continue;
+        }
+        let mut ident = String::new();
+        ident.push(first);
+        chars.next();
+        while let Some((_, ch)) = chars.peek().copied() {
+            if !is_ident_continue(ch) {
+                break;
+            }
+            ident.push(ch);
+            chars.next();
+        }
+        v.found.insert(ident);
+    }
+}
+
+fn is_ident_start(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphabetic()
+}
+
+fn is_ident_continue(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphanumeric()
 }
 
 fn scan_attr_string_path_literal(lit: &proc_macro2::Literal, v: &mut IdentCollector) {
@@ -229,7 +278,8 @@ pub fn render_uses_for_with_local_roots(
     }
     let keep_globs = idents
         .iter()
-        .any(|ident| is_type_like_ident(ident) && !provided.contains(ident));
+        .any(|ident| is_type_like_ident(ident) && !provided.contains(ident))
+        || glob_prelude_hint_is_used(idents);
 
     all_uses
         .iter()
@@ -331,8 +381,26 @@ fn macro_companion_hint_is_used(binding: &str, idents: &HashSet<String>) -> bool
     }
 }
 
+fn glob_prelude_hint_is_used(idents: &HashSet<String>) -> bool {
+    idents.contains("into_par_iter")
+        || idents.contains("into_par_bridge")
+        || idents.contains("par_iter")
+        || idents.contains("par_iter_mut")
+        || idents.contains("par_chunks")
+        || idents.contains("par_chunks_mut")
+        || idents.contains("par_sort")
+        || idents.contains("par_sort_unstable")
+}
+
 fn trait_method_hint_is_used(binding: &str, idents: &HashSet<String>) -> bool {
     match binding {
+        "Aead" => idents.contains("encrypt") || idents.contains("decrypt"),
+        "AeadInPlace" => {
+            idents.contains("encrypt_in_place")
+                || idents.contains("decrypt_in_place")
+                || idents.contains("encrypt_in_place_detached")
+                || idents.contains("decrypt_in_place_detached")
+        }
         "AsGenericAudioBufferRef" => idents.contains("as_generic_audio_buffer_ref"),
         "AudioMut" => idents.contains("plane_mut") || idents.contains("plane_pair_mut"),
         "DeviceTrait" => {
@@ -419,6 +487,22 @@ fn trait_method_hint_is_used(binding: &str, idents: &HashSet<String>) -> bool {
                 || idents.contains("write_f32")
                 || idents.contains("write_f64")
         }
+        "ReadBytesExt" => {
+            idents.contains("read_i8")
+                || idents.contains("read_i16")
+                || idents.contains("read_i24")
+                || idents.contains("read_i32")
+                || idents.contains("read_i64")
+                || idents.contains("read_i128")
+                || idents.contains("read_u8")
+                || idents.contains("read_u16")
+                || idents.contains("read_u24")
+                || idents.contains("read_u32")
+                || idents.contains("read_u64")
+                || idents.contains("read_u128")
+                || idents.contains("read_f32")
+                || idents.contains("read_f64")
+        }
         "Read" => {
             idents.contains("read")
                 || idents.contains("read_exact")
@@ -427,6 +511,7 @@ fn trait_method_hint_is_used(binding: &str, idents: &HashSet<String>) -> bool {
         }
         "Write" => {
             idents.contains("write")
+                || idents.contains("write_all")
                 || idents.contains("write_fmt")
                 || idents.contains("write_str")
                 || idents.contains("writeln")
@@ -447,6 +532,8 @@ fn trait_method_hint_is_used(binding: &str, idents: &HashSet<String>) -> bool {
         "Context" => idents.contains("context") || idents.contains("with_context"),
         "FromStr" => idents.contains("from_str"),
         "ValueEnum" => idents.contains("from_str") || idents.contains("value_variants"),
+        "KeyInit" => idents.contains("new") || idents.contains("new_from_slice"),
+        "Spanned" => idents.contains("span"),
         "Digest" => {
             idents.contains("finalize") || idents.contains("new") || idents.contains("update")
         }
@@ -582,6 +669,12 @@ fn trait_method_hint_is_used(binding: &str, idents: &HashSet<String>) -> bool {
                 || idents.contains("choose_multiple")
                 || idents.contains("choose_weighted")
                 || idents.contains("partial_shuffle")
+        }
+        "SymbolicTraitAccessors" => idents.contains("is_monospace") || idents.contains("is_italic"),
+        "TraitAccessors" => {
+            idents.contains("normalized_slant")
+                || idents.contains("normalized_weight")
+                || idents.contains("normalized_width")
         }
         _ => false,
     }
@@ -982,6 +1075,17 @@ mod tests {
     }
 
     #[test]
+    fn bucket_idents_include_format_string_captures() {
+        let idents = bucket_idents(
+            "fn greeting() -> String { let MPD_VERSION = \"0.23.5\"; format!(\"OK MPD {MPD_VERSION}\\n\") }\n",
+        )
+        .expect("source parses");
+
+        assert!(idents.contains("format"), "idents={idents:?}");
+        assert!(idents.contains("MPD_VERSION"), "idents={idents:?}");
+    }
+
+    #[test]
     fn cpal_extension_trait_imports_survive_method_syntax() {
         use crate::item::{ItemKind, ItemVis, ParsedItem};
         use std::collections::HashSet;
@@ -1158,6 +1262,164 @@ mod tests {
         let rendered = render_uses_for(&[&item], &idents, &HashSet::new(), false);
 
         assert!(rendered.contains("FmtWrite"), "rendered={rendered}");
+    }
+
+    #[test]
+    fn std_io_write_trait_survives_write_all_method_syntax() {
+        use crate::item::{ItemKind, ItemVis, ParsedItem};
+        use std::collections::HashSet;
+
+        let write_use = ParsedItem {
+            id: 0,
+            kind: ItemKind::Use,
+            name: String::new(),
+            vis: ItemVis::Private,
+            is_cfg_test: false,
+            line_start: 1,
+            line_end: 1,
+            source: "use std::io::Write;".to_string(),
+            refs: Vec::new(),
+        };
+        let idents = HashSet::from(["write_all".to_string()]);
+
+        let rendered = render_uses_for(&[&write_use], &idents, &HashSet::new(), false);
+
+        assert!(rendered.contains("Write"), "rendered={rendered}");
+    }
+
+    #[test]
+    fn rayon_prelude_glob_survives_parallel_method_syntax() {
+        use crate::item::{ItemKind, ItemVis, ParsedItem};
+        use std::collections::HashSet;
+
+        let rayon_use = ParsedItem {
+            id: 0,
+            kind: ItemKind::Use,
+            name: String::new(),
+            vis: ItemVis::Private,
+            is_cfg_test: false,
+            line_start: 1,
+            line_end: 1,
+            source: "use rayon::prelude::*;".to_string(),
+            refs: Vec::new(),
+        };
+        let idents = HashSet::from(["into_par_iter".to_string()]);
+
+        let rendered = render_uses_for(&[&rayon_use], &idents, &HashSet::new(), false);
+
+        assert!(
+            rendered.contains("rayon::prelude::*"),
+            "rendered={rendered}"
+        );
+    }
+
+    #[test]
+    fn syn_spanned_trait_survives_span_method_syntax() {
+        use crate::item::{ItemKind, ItemVis, ParsedItem};
+        use std::collections::HashSet;
+
+        let spanned_use = ParsedItem {
+            id: 0,
+            kind: ItemKind::Use,
+            name: String::new(),
+            vis: ItemVis::Private,
+            is_cfg_test: false,
+            line_start: 1,
+            line_end: 1,
+            source: "use syn::spanned::Spanned;".to_string(),
+            refs: Vec::new(),
+        };
+        let idents = HashSet::from(["span".to_string()]);
+
+        let rendered = render_uses_for(&[&spanned_use], &idents, &HashSet::new(), false);
+
+        assert!(rendered.contains("Spanned"), "rendered={rendered}");
+    }
+
+    #[test]
+    fn aead_traits_survive_method_syntax() {
+        use crate::item::{ItemKind, ItemVis, ParsedItem};
+        use std::collections::HashSet;
+
+        let aead_use = ParsedItem {
+            id: 0,
+            kind: ItemKind::Use,
+            name: String::new(),
+            vis: ItemVis::Private,
+            is_cfg_test: false,
+            line_start: 1,
+            line_end: 1,
+            source: "use chacha20poly1305::aead::{Aead, AeadInPlace, KeyInit};".to_string(),
+            refs: Vec::new(),
+        };
+        let idents = HashSet::from([
+            "decrypt".to_string(),
+            "encrypt_in_place_detached".to_string(),
+            "new_from_slice".to_string(),
+        ]);
+
+        let rendered = render_uses_for(&[&aead_use], &idents, &HashSet::new(), false);
+
+        assert!(rendered.contains("Aead"), "rendered={rendered}");
+        assert!(rendered.contains("AeadInPlace"), "rendered={rendered}");
+        assert!(rendered.contains("KeyInit"), "rendered={rendered}");
+    }
+
+    #[test]
+    fn byteorder_read_bytes_ext_survives_read_u24_method_syntax() {
+        use crate::item::{ItemKind, ItemVis, ParsedItem};
+        use std::collections::HashSet;
+
+        let read_use = ParsedItem {
+            id: 0,
+            kind: ItemKind::Use,
+            name: String::new(),
+            vis: ItemVis::Private,
+            is_cfg_test: false,
+            line_start: 1,
+            line_end: 1,
+            source: "use byteorder::{BigEndian, ReadBytesExt};".to_string(),
+            refs: Vec::new(),
+        };
+        let idents = HashSet::from(["BigEndian".to_string(), "read_u24".to_string()]);
+
+        let rendered = render_uses_for(&[&read_use], &idents, &HashSet::new(), false);
+
+        assert!(rendered.contains("ReadBytesExt"), "rendered={rendered}");
+    }
+
+    #[test]
+    fn core_text_trait_accessors_survive_method_syntax() {
+        use crate::item::{ItemKind, ItemVis, ParsedItem};
+        use std::collections::HashSet;
+
+        let core_text_use = ParsedItem {
+            id: 0,
+            kind: ItemKind::Use,
+            name: String::new(),
+            vis: ItemVis::Private,
+            is_cfg_test: false,
+            line_start: 1,
+            line_end: 1,
+            source: "use core_text::font_descriptor::{SymbolicTraitAccessors, TraitAccessors};"
+                .to_string(),
+            refs: Vec::new(),
+        };
+        let idents = HashSet::from([
+            "is_italic".to_string(),
+            "is_monospace".to_string(),
+            "normalized_slant".to_string(),
+            "normalized_weight".to_string(),
+            "normalized_width".to_string(),
+        ]);
+
+        let rendered = render_uses_for(&[&core_text_use], &idents, &HashSet::new(), false);
+
+        assert!(
+            rendered.contains("SymbolicTraitAccessors"),
+            "rendered={rendered}"
+        );
+        assert!(rendered.contains("TraitAccessors"), "rendered={rendered}");
     }
 
     #[test]

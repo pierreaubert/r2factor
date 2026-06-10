@@ -8,6 +8,7 @@ use crate::item::{self, ParsedItem};
 use crate::llm::{self, AdvisorOutcome, LlmConfig};
 use crate::plan::{self, Plan};
 use crate::tokensave::{CrossFileEvidence, Tokensave};
+use crate::verify;
 use crate::write::{self, WriteReport};
 use anyhow::Result;
 use serde::Deserialize;
@@ -21,7 +22,10 @@ pub fn run_split(path: &Path, opts: SplitOptions) -> Result<()> {
     if path.is_dir() {
         return run_split_dir(path, &opts, true);
     }
-    run_split_inner(path, &opts, 0, true).map(|_| ())
+    if let Some(tree) = run_split_inner(path, &opts, 0, true)? {
+        verify_file_split_if_package(path, &tree, true)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -31,7 +35,9 @@ pub struct SplitWriteTree {
 }
 
 pub fn split_write_tree(path: &Path, opts: SplitOptions) -> Result<SplitWriteTree> {
-    split_write_tree_inner(path, opts, false)
+    let tree = split_write_tree_inner(path, opts, false)?;
+    verify_file_split_if_package(path, &tree, false)?;
+    Ok(tree)
 }
 
 pub fn split_write_tree_with_output(path: &Path, opts: SplitOptions) -> Result<SplitWriteTree> {
@@ -76,15 +82,32 @@ fn run_split_dir(root: &Path, opts: &SplitOptions, emit: bool) -> Result<()> {
             root.display()
         );
     }
+    let mut trees = Vec::new();
     for path in &files {
         if emit {
             eprintln!("[write] split {}", path.display());
         }
-        run_split_inner(path, opts, 0, emit)?;
+        if let Some(tree) = run_split_inner(path, opts, 0, emit)? {
+            trees.push(tree);
+        }
     }
     if emit {
-        verify_directory_split(root, &files)?;
+        verify_directory_split(root, &files, &trees)?;
     }
+    Ok(())
+}
+
+fn verify_file_split_if_package(file: &Path, tree: &SplitWriteTree, emit: bool) -> Result<()> {
+    if verify::locate_package_manifest(file).is_none() {
+        if emit {
+            eprintln!(
+                "[check] skipped: no Cargo.toml with [package] found above {}",
+                file.display()
+            );
+        }
+        return Ok(());
+    }
+    verify::verify_split_with_rollback(file, tree)?;
     Ok(())
 }
 
@@ -343,7 +366,11 @@ struct CargoPackage {
     manifest_path: PathBuf,
 }
 
-fn verify_directory_split(root: &Path, changed_files: &[PathBuf]) -> Result<()> {
+fn verify_directory_split(
+    root: &Path,
+    changed_files: &[PathBuf],
+    trees: &[SplitWriteTree],
+) -> Result<()> {
     if changed_files.is_empty() {
         eprintln!("[check] skipped: no files were split");
         return Ok(());
@@ -361,26 +388,51 @@ fn verify_directory_split(root: &Path, changed_files: &[PathBuf]) -> Result<()> 
         .unwrap_or_else(|| root.to_path_buf());
     let packages = affected_packages(&workspace_root, changed_files)?;
     if packages.is_empty() {
-        if let Err(err) = run_cargo_report(&workspace_root, &["check"]) {
+        if let Err(failure) = run_cargo_report(&workspace_root, &manifest, &["check"]) {
             eprintln!(
                 "[test] not run: cargo check failed; after fixing, run `cargo test` for a full test report"
             );
-            return Err(err);
+            let reports = verify::fail_with_rollback_reports(root, trees, vec![*failure])?;
+            anyhow::bail!(
+                "[check] cargo check failed; wrote {} bug report(s): {}",
+                reports.bug_reports.len(),
+                display_paths(&reports.bug_reports)
+            );
         }
         eprintln!("[test] skipped: run `cargo test` for a full test report");
         return Ok(());
     }
     let package_list = test_report_commands(&packages);
+    let mut failures = Vec::new();
     for package in &packages {
-        if let Err(err) = run_cargo_report(&workspace_root, &["check", "-p", package]) {
+        if let Err(failure) =
+            run_cargo_report(&workspace_root, &manifest, &["check", "-p", package])
+        {
             eprintln!(
                 "[test] not run: cargo check failed; after fixing, run {package_list} for a full test report"
             );
-            return Err(err);
+            failures.push(*failure);
         }
+    }
+    if !failures.is_empty() {
+        let reports = verify::fail_with_rollback_reports(root, trees, failures)?;
+        anyhow::bail!(
+            "[check] cargo check failed for {} package(s); wrote {} bug report(s): {}",
+            reports.bug_reports.len(),
+            reports.bug_reports.len(),
+            display_paths(&reports.bug_reports)
+        );
     }
     eprintln!("[test] skipped: run {package_list} for a full test report");
     Ok(())
+}
+
+fn display_paths(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn test_report_commands(packages: &BTreeSet<String>) -> String {
@@ -433,9 +485,14 @@ fn affected_packages(root: &Path, changed_files: &[PathBuf]) -> Result<BTreeSet<
     Ok(packages)
 }
 
-fn run_cargo_report(root: &Path, args: &[&str]) -> Result<()> {
+fn run_cargo_report(
+    root: &Path,
+    manifest: &Path,
+    args: &[&str],
+) -> std::result::Result<(), Box<verify::CargoVerifyFailure>> {
     let command = format!("cargo {}", args.join(" "));
     eprintln!("[check] {command}");
+    let argv = cargo_argv_strings(args);
     let output = std::process::Command::new(cargo_program())
         .args(args)
         .current_dir(root)
@@ -443,7 +500,12 @@ fn run_cargo_report(root: &Path, args: &[&str]) -> Result<()> {
     let output = match output {
         Ok(output) => output,
         Err(e) => {
-            anyhow::bail!("[check] {command} failed to start: {e}");
+            return Err(Box::new(verify::CargoVerifyFailure::for_launch_error(
+                Some(manifest.to_path_buf()),
+                Vec::new(),
+                argv,
+                format!("[check] {command} failed to start: {e}"),
+            )));
         }
     };
     if output.status.success() {
@@ -459,7 +521,18 @@ fn run_cargo_report(root: &Path, args: &[&str]) -> Result<()> {
         eprintln!("--- {command} stderr ---");
         eprintln!("{}", String::from_utf8_lossy(&output.stderr));
     }
-    anyhow::bail!("[check] {command} failed")
+    Err(Box::new(verify::CargoVerifyFailure::for_command_output(
+        Some(manifest.to_path_buf()),
+        Vec::new(),
+        argv,
+        output,
+    )))
+}
+
+fn cargo_argv_strings(args: &[&str]) -> Vec<String> {
+    std::iter::once("cargo".to_string())
+        .chain(args.iter().map(|arg| (*arg).to_string()))
+        .collect()
 }
 
 fn cargo_program() -> OsString {

@@ -682,7 +682,7 @@ fn is_cross_importable(it: &ParsedItem) -> bool {
 /// to prefix. Impls/macros/use/extern blocks don't take visibility, so we
 /// skip them — even if a private "impl" target is referenced cross-bucket,
 /// the issue is whoever wrote the impl, not visibility.
-fn needs_keyword_rewrite(it: &ParsedItem) -> bool {
+pub(crate) fn needs_keyword_rewrite(it: &ParsedItem) -> bool {
     use crate::item::ItemKind as K;
     matches!(
         it.kind,
@@ -721,13 +721,21 @@ fn needs_keyword_rewrite(it: &ParsedItem) -> bool {
 /// fails, which shouldn't happen since promoted items came through
 /// `parse_file` originally.
 pub fn add_pub_super(source: &str) -> String {
-    if let Some(out) = add_pub_super_via_syn(source) {
-        return out;
-    }
-    add_pub_super_line_based(source)
+    add_visibility(source, "pub(super) ")
 }
 
-fn add_pub_super_via_syn(source: &str) -> Option<String> {
+pub fn add_pub_crate(source: &str) -> String {
+    add_visibility(source, "pub(crate) ")
+}
+
+fn add_visibility(source: &str, visibility: &str) -> String {
+    if let Some(out) = add_visibility_via_syn(source, visibility) {
+        return out;
+    }
+    add_visibility_line_based(source, visibility)
+}
+
+fn add_visibility_via_syn(source: &str, visibility: &str) -> Option<String> {
     let file = syn::parse_file(source).ok()?;
     let item = file.items.first()?;
 
@@ -754,7 +762,7 @@ fn add_pub_super_via_syn(source: &str) -> Option<String> {
         if p > out.len() {
             return None;
         }
-        out.insert_str(p, "pub(super) ");
+        out.insert_str(p, visibility);
     }
     Some(out)
 }
@@ -895,7 +903,7 @@ pub(crate) fn line_col_to_byte_offset(src: &str, line: usize, column: usize) -> 
 /// happen on items r2factor itself emits). Skips attribute / doc / comment /
 /// blank lines and inserts `pub(super) ` before the first remaining line.
 /// Not robust to multi-line attributes — that's why it's the fallback.
-fn add_pub_super_line_based(source: &str) -> String {
+fn add_visibility_line_based(source: &str, visibility: &str) -> String {
     let mut out = String::new();
     let mut promoted = false;
     let lines: Vec<&str> = source.lines().collect();
@@ -910,7 +918,7 @@ fn add_pub_super_line_based(source: &str) -> String {
         }
         let indent_end = line.len() - line.trim_start().len();
         out.push_str(&line[..indent_end]);
-        out.push_str("pub(super) ");
+        out.push_str(visibility);
         out.push_str(line[indent_end..].trim_start());
         if !last {
             out.push('\n');

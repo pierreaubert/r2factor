@@ -639,11 +639,10 @@ fn main() -> Result<()> {
             if write {
                 if file.is_dir() {
                     r2factor::run_split(&file, opts)?;
+                } else if verify {
+                    r2factor::run_split(&file, opts)?;
                 } else {
-                    let tree = r2factor::pipeline::split_write_tree_with_output(&file, opts)?;
-                    if verify {
-                        r2factor::verify::verify_split_with_rollback(&file, &tree)?;
-                    }
+                    r2factor::pipeline::split_write_tree_with_output(&file, opts)?;
                 }
             } else {
                 r2factor::run_split(&file, opts)?;

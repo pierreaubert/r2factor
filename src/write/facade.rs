@@ -17,6 +17,8 @@ pub fn render_facade(
     sub_modules: &[String],
     reexport_modules: &BTreeSet<String>,
     path_prefix: Option<&str>,
+    proc_macro_exports: &[String],
+    crate_root_imports: &BTreeSet<CrossImport>,
     promote: &BTreeSet<ItemId>,
     impl_lifts: &BTreeSet<ItemId>,
     facade_imports: &BTreeSet<CrossImport>,
@@ -69,6 +71,23 @@ pub fn render_facade(
         }
     }
     if !sub_modules.is_empty() {
+        buf.push('\n');
+    }
+
+    for export in proc_macro_exports {
+        buf.push_str(export);
+        buf.push_str("\n\n");
+    }
+
+    if !crate_root_imports.is_empty() {
+        for imp in crate_root_imports {
+            for cfg in &imp.cfg_attrs {
+                let _ = writeln!(buf, "{cfg}");
+            }
+            if let Some(src) = &imp.source_bucket {
+                let _ = writeln!(buf, "pub(crate) use {src}::{name};", name = imp.name);
+            }
+        }
         buf.push('\n');
     }
 

@@ -92,6 +92,32 @@ fn compile_check(tmp_root: &Path, stem: &str) {
     }
 }
 
+fn compile_lib_root(lib_path: &Path) {
+    let tmp_root = lib_path.parent().expect("lib parent");
+    let out_dir = tmp_root.join("rustc-out");
+    fs::create_dir_all(&out_dir).expect("mkdir rustc-out");
+
+    let output = Command::new("rustc")
+        .arg("--edition=2024")
+        .arg("--crate-type=lib")
+        .arg("--emit=metadata")
+        .arg("-Awarnings")
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .arg(lib_path)
+        .output()
+        .expect("invoke rustc");
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let facade = fs::read_to_string(lib_path).unwrap_or_else(|_| "<facade unreadable>".into());
+        panic!(
+            "split lib root failed to compile.\n\n--- rustc stderr ---\n{stderr}\n--- rustc stdout ---\n{stdout}\n--- facade ---\n{facade}"
+        );
+    }
+}
+
 fn compile_test_check(tmp_root: &Path, stem: &str) {
     let lib_path = tmp_root.join("lib.rs");
     fs::write(&lib_path, format!("#![allow(warnings)]\npub mod {stem};\n")).expect("write lib.rs");
@@ -216,6 +242,35 @@ fn compile_binary_root(path: &Path) {
         let facade = fs::read_to_string(path).unwrap_or_else(|_| "<facade unreadable>".into());
         panic!(
             "split binary root {} failed to compile.\n\n--- rustc stderr ---\n{stderr}\n--- rustc stdout ---\n{stdout}\n--- facade ---\n{facade}",
+            path.display()
+        );
+    }
+}
+
+fn compile_proc_macro_root(path: &Path) {
+    let out_dir = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("rustc-proc-macro-out");
+    fs::create_dir_all(&out_dir).expect("mkdir rustc-proc-macro-out");
+
+    let output = Command::new("rustc")
+        .arg("--edition=2024")
+        .arg("--crate-type=proc-macro")
+        .arg("--emit=metadata")
+        .arg("-Awarnings")
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .arg(path)
+        .output()
+        .expect("invoke rustc proc macro");
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let facade = fs::read_to_string(path).unwrap_or_else(|_| "<facade unreadable>".into());
+        panic!(
+            "split proc-macro root {} failed to compile.\n\n--- rustc stderr ---\n{stderr}\n--- rustc stdout ---\n{stdout}\n--- facade ---\n{facade}",
             path.display()
         );
     }
@@ -390,6 +445,83 @@ fn parser_lexer_integration_test() {
     );
 
     compile_check(tmp.path(), "test_place");
+}
+
+#[test]
+fn external_module_crate_root_private_refs_survive_lib_split() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let lib = tmp.path().join("lib.rs");
+    fs::write(
+        tmp.path().join("denoise.rs"),
+        r#"use crate::{Complex, NB_DELTA_CEPS};
+
+pub fn denoise(buf: &mut [f32]) -> Complex {
+    crate::apply_window(buf);
+    [NB_DELTA_CEPS as f32, buf.len() as f32]
+}
+"#,
+    )
+    .expect("write denoise.rs");
+    fs::write(
+        &lib,
+        r#"mod denoise;
+
+type Complex = [f32; 2];
+
+const NB_DELTA_CEPS: usize = 2;
+
+fn apply_window(buf: &mut [f32]) {
+    for sample in buf {
+        *sample *= 0.5;
+    }
+}
+
+pub struct Denoiser;
+
+impl Denoiser {
+    pub fn process(buf: &mut [f32]) -> Complex {
+        denoise::denoise(buf)
+    }
+}
+
+pub struct OtherApi;
+"#,
+    )
+    .expect("write lib.rs");
+
+    run_split(
+        &lib,
+        SplitOptions {
+            use_tokensave: false,
+            llm: None,
+            write: Some(WriteOptions {
+                force: false,
+                recursive_max_lines: Some(0),
+            }),
+        },
+    )
+    .expect("split lib.rs");
+
+    let facade_src = fs::read_to_string(&lib).expect("read facade");
+    assert!(
+        facade_src.contains("pub(crate) use") && facade_src.contains("Complex"),
+        "facade should preserve crate::Complex for existing modules:\n{facade_src}"
+    );
+    assert!(
+        facade_src.contains("pub(crate) use") && facade_src.contains("NB_DELTA_CEPS"),
+        "facade should preserve crate::NB_DELTA_CEPS for existing modules:\n{facade_src}"
+    );
+    assert!(
+        facade_src.contains("pub(crate) use") && facade_src.contains("apply_window"),
+        "facade should preserve crate::apply_window for existing modules:\n{facade_src}"
+    );
+    let generated =
+        fs::read_to_string(tmp.path().join("lib").join("misc.rs")).expect("read generated misc.rs");
+    assert!(
+        generated.contains("pub(crate) fn apply_window"),
+        "externally referenced private fn should be lifted to pub(crate):\n{generated}"
+    );
+    compile_lib_root(&lib);
 }
 
 #[test]
@@ -859,6 +991,71 @@ pub fn value() -> u32 {
     assert_parses(&file);
     assert_parses(&tmp.path().join("types.rs"));
     compile_check(tmp.path(), "widget");
+}
+
+#[test]
+fn proc_macro_entrypoints_stay_at_crate_root_with_child_impls() {
+    let src = r#"extern crate proc_macro;
+
+use proc_macro::TokenStream;
+
+#[proc_macro_derive(Hello, attributes(hello))]
+pub fn derive_hello(input: TokenStream) -> TokenStream {
+    expand_hello(input)
+}
+
+fn expand_hello(input: TokenStream) -> TokenStream {
+    input
+}
+
+struct Helper;
+"#;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let file = tmp.path().join("lib.rs");
+    fs::write(&file, src).expect("write proc macro lib.rs");
+
+    run_split(
+        &file,
+        SplitOptions {
+            use_tokensave: false,
+            llm: None,
+            write: Some(WriteOptions {
+                force: false,
+                recursive_max_lines: Some(0),
+            }),
+        },
+    )
+    .expect("split proc macro lib.rs");
+
+    let facade_src = fs::read_to_string(&file).expect("read generated lib.rs");
+    assert!(
+        facade_src.contains("proc_macro_derive")
+            && facade_src.contains("pub fn derive_hello")
+            && facade_src.contains("__r2factor_derive_hello_impl"),
+        "proc macro export should remain as a crate-root wrapper; got:\n{facade_src}"
+    );
+
+    let generated_children = fs::read_dir(tmp.path())
+        .expect("read tempdir")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.extension().and_then(|ext| ext.to_str()) == Some("rs")
+                && path.file_name().and_then(|name| name.to_str()) != Some("lib.rs")
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        generated_children.iter().any(|path| {
+            let src = fs::read_to_string(path).expect("read generated child");
+            src.contains("__r2factor_derive_hello_impl") && !src.contains("proc_macro_derive")
+        }),
+        "a generated child should contain the plain proc macro implementation; children: {generated_children:?}"
+    );
+
+    assert_parses(&file);
+    for path in generated_children {
+        assert_parses(&path);
+    }
+    compile_proc_macro_root(&file);
 }
 
 #[test]
@@ -1995,6 +2192,40 @@ pub fn render_other(widget: &Widget) -> u32 {
 }
 
 #[test]
+fn generated_child_promotes_private_sibling_extension_trait_for_method_call() {
+    let src = r#"pub struct Widget;
+
+trait WidgetExt {
+    fn tweak(&self) -> u32;
+}
+
+impl WidgetExt for Widget {
+    fn tweak(&self) -> u32 { 7 }
+}
+
+pub fn render_widget(widget: &Widget) -> u32 {
+    widget.tweak()
+}
+
+pub fn render_other(widget: &Widget) -> u32 {
+    render_widget(widget)
+}
+"#;
+    let (tmp, _facade, sub_dir) = split_in_tempdir("demo", src);
+    let generated = fs::read_to_string(sub_dir.join("render.rs")).expect("read render.rs");
+    assert!(
+        generated.contains("WidgetExt"),
+        "child calling extension method should import the trait; got:\n{generated}"
+    );
+    let promoted = fs::read_to_string(sub_dir.join("widget_ext.rs")).expect("read widget_ext.rs");
+    assert!(
+        promoted.contains("pub(super) trait WidgetExt"),
+        "private extension trait should be promoted for sibling imports; got:\n{promoted}"
+    );
+    compile_check(tmp.path(), "demo");
+}
+
+#[test]
 fn include_macro_targeting_generated_bucket_is_not_duplicated_in_facade() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let file = tmp.path().join("demo.rs");
@@ -2787,5 +3018,103 @@ edition = "2024"
     assert!(
         stderr.contains("[test] not run: cargo check failed; after fixing, run `cargo test -p demo` for a full test report"),
         "stderr should suggest full test report after check failure:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("[verify] bug report ->"),
+        "stderr should include rollback bug report path:\n{stderr}"
+    );
+    assert!(
+        !src_dir.join("long_a").exists(),
+        "generated split directory should be removed on verification failure"
+    );
+    let restored = fs::read_to_string(src_dir.join("long_a.rs")).expect("read restored long_a");
+    assert!(
+        restored.contains("missing_symbol_0()"),
+        "facade should be restored to the original source:\n{restored}"
+    );
+    assert!(
+        !restored.contains("pub mod misc;"),
+        "restored source should not remain an r2factor facade:\n{restored}"
+    );
+    let report_dir = tmp.path().join(".r2factor/bug-reports");
+    let reports = fs::read_dir(&report_dir)
+        .expect("bug report dir")
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .expect("bug report entries");
+    assert_eq!(reports.len(), 1);
+    let report = fs::read_to_string(reports[0].path()).expect("read bug report");
+    assert!(report.contains("cargo check -p demo"), "{report}");
+    assert!(report.contains("cannot find function"), "{report}");
+    assert!(report.contains("## Split Tree"), "{report}");
+}
+
+#[test]
+fn split_write_directory_continues_package_checks_after_failure() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    fs::write(
+        tmp.path().join("Cargo.toml"),
+        r#"[workspace]
+members = ["a", "b"]
+resolver = "3"
+"#,
+    )
+    .expect("write workspace Cargo.toml");
+    for package in ["a", "b"] {
+        let package_dir = tmp.path().join(package);
+        let src_dir = package_dir.join("src");
+        fs::create_dir_all(&src_dir).expect("mkdir package src");
+        fs::write(
+            package_dir.join("Cargo.toml"),
+            format!("[package]\nname = \"{package}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"),
+        )
+        .expect("write package manifest");
+        fs::write(src_dir.join("lib.rs"), "pub mod long;\n").expect("write lib.rs");
+        let mut long = String::new();
+        for i in 0..8 {
+            long.push_str(&format!(
+                "pub fn parse_{package}_{i}(input: &str) -> usize {{\n    input.len() + missing_{package}_{i}()\n}}\n\n"
+            ));
+        }
+        fs::write(src_dir.join("long.rs"), long).expect("write long.rs");
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_r2factor"))
+        .arg("split")
+        .arg("--no-tokensave")
+        .arg("--write")
+        .arg("--max-lines")
+        .arg("10")
+        .arg(tmp.path())
+        .output()
+        .expect("run r2factor split directory");
+
+    assert!(
+        !output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("[check] cargo check -p a failed"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("[check] cargo check -p b failed"),
+        "directory verification should continue after the first package failure:\n{stderr}"
+    );
+    let report_dir = tmp.path().join(".r2factor/bug-reports");
+    let reports = fs::read_dir(&report_dir)
+        .expect("bug report dir")
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .expect("bug report entries");
+    assert_eq!(reports.len(), 2);
+    assert!(
+        !tmp.path().join("a/src/long").exists(),
+        "generated split dir for package a should be removed"
+    );
+    assert!(
+        !tmp.path().join("b/src/long").exists(),
+        "generated split dir for package b should be removed"
     );
 }
