@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.1.7 - 2026-06-10
+
+### Fixed
+
+- Rewrite stale `use super::name` paths inside extracted inline modules when the target item moved to a sibling sub-bucket (`use super::name` → `use super::bucket::name`).
+- Pin items carrying `#[docify::export]` to the facade so `docify::embed!` paths remain valid after splitting.
+- Expand trait method hints for Substrate/Polkadot crates: `Decode`, `Zero`, `One`, `Bounded`, `CheckedAdd`, `CheckedSub`, `CheckedMul`, `CheckedDiv`, `Saturating`, `SaturatedConversion`, `UniqueSaturatedInto`, `Convert`, `StaticLookup`, `Verify`, `IdentifyAccount`, `AppKey`, `OpaqueKeys`.
+- Expand derive-macro binding hints for attribute macro name mismatches: `FromPrimitive`, `ToPrimitive`, `RuntimeDebug`.
+
+## 0.1.6 - 2026-06-10
+
+### Fixed
+
+- Preserve `quote::ToTokens` imports when generated buckets use `.to_token_stream()` method syntax.
+- Preserve `inflector::Inflector` imports when buckets use `.to_snake_case()`, `.to_pascal_case()`, or `.to_screaming_snake_case()`.
+- Preserve `secrecy::ExposeSecret` imports when buckets use `.expose_secret()`.
+- Preserve `sp_core::crypto::Pair` and `CryptoBytes` imports when buckets use `LEN`, `from_ss58check`, or `to_ss58check`.
+- Preserve derive-macro imports whose attribute-macro name differs from the imported binding (`thiserror::Error` → `#[error(...)]`, `derive_more::From` → `#[from(...)]`, `derive_more::Display` → `#[display(...)]`).
+- Rebase paths to inline modules that remain in the facade (`std_features`, `host_function_registry`, etc.) by including them in `local_module_roots`.
+- Skip `pub use {module}::*;` wildcard re-exports entirely for proc-macro crates, preventing E0457 when helper modules contain non-proc-macro items.
+
 ## 0.1.5 - 2026-06-09
 
 ### Fixed

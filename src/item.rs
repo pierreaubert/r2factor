@@ -95,6 +95,17 @@ impl ParsedItem {
             Ok(syn::Item::Mod(module)) if module.content.is_none()
         )
     }
+
+    /// Whether this item carries `#[docify::export]` (or `#[docify::export(...)]`).
+    /// Docify-exported items must stay in the facade because other files embed
+    /// them via `docify::embed!("./src/lib.rs", item_name)` which resolves at
+    /// compile time against the original file path.
+    pub fn is_docify_export(&self) -> bool {
+        let Ok(item) = syn::parse_str::<syn::Item>(&self.source) else {
+            return false;
+        };
+        item_attrs(&item).iter().any(is_docify_export_attr)
+    }
 }
 
 pub fn parse_file(src: &str) -> Result<Vec<ParsedItem>> {
@@ -300,6 +311,13 @@ fn is_cfg_test_attr(attr: &Attribute) -> bool {
 
 fn is_test_attr(attr: &Attribute) -> bool {
     attr.path().is_ident("test")
+}
+
+fn is_docify_export_attr(attr: &Attribute) -> bool {
+    let segs: Vec<_> = attr.path().segments.iter().collect();
+    segs.len() == 2
+        && segs[0].ident == "docify"
+        && segs[1].ident == "export"
 }
 
 fn type_to_anchor(ty: &Type) -> String {

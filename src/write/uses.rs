@@ -372,11 +372,28 @@ fn binding_is_used(binding: &str, idents: &HashSet<String>) -> bool {
     idents.contains(binding)
         || trait_method_hint_is_used(binding, idents)
         || macro_companion_hint_is_used(binding, idents)
+        || derive_macro_binding_is_used(binding, idents)
 }
 
 fn macro_companion_hint_is_used(binding: &str, idents: &HashSet<String>) -> bool {
     match binding {
         "sel" | "sel_impl" => idents.contains("msg_send") || idents.contains("sel"),
+        _ => false,
+    }
+}
+
+/// Derive and attribute macro imports often bring a macro whose invocation
+/// name differs from the imported binding.
+///   `use thiserror::Error;` → `#[error(...)]`   (binding "Error", attr "error")
+///   `use derive_more::From;`  → `#[from(...)]`   (binding "From", attr "from")
+fn derive_macro_binding_is_used(binding: &str, idents: &HashSet<String>) -> bool {
+    match binding {
+        "Error" => idents.contains("error"),
+        "From" => idents.contains("from"),
+        "Display" => idents.contains("display"),
+        "FromPrimitive" => idents.contains("from_primitive"),
+        "ToPrimitive" => idents.contains("to_primitive"),
+        "RuntimeDebug" => idents.contains("runtime_debug"),
         _ => false,
     }
 }
@@ -676,6 +693,47 @@ fn trait_method_hint_is_used(binding: &str, idents: &HashSet<String>) -> bool {
                 || idents.contains("normalized_weight")
                 || idents.contains("normalized_width")
         }
+        "ToTokens" => idents.contains("to_token_stream"),
+        "Inflector" => {
+            idents.contains("to_snake_case")
+                || idents.contains("to_pascal_case")
+                || idents.contains("to_screaming_snake_case")
+        }
+        "ExposeSecret" => idents.contains("expose_secret"),
+        "Pair" => {
+            idents.contains("LEN")
+                || idents.contains("from_ss58check")
+                || idents.contains("to_ss58check")
+                || idents.contains("from_ss58check_with_version")
+                || idents.contains("to_ss58check_with_version")
+        }
+        "CryptoBytes" => {
+            idents.contains("to_ss58check")
+                || idents.contains("from_ss58check")
+        }
+        "Decode" => idents.contains("decode"),
+        "One" => idents.contains("one") || idents.contains("is_one"),
+        "Bounded" => idents.contains("min_value") || idents.contains("max_value"),
+        "CheckedAdd" => idents.contains("checked_add"),
+        "CheckedSub" => idents.contains("checked_sub"),
+        "CheckedMul" => idents.contains("checked_mul"),
+        "CheckedDiv" => idents.contains("checked_div"),
+        "Saturating" => {
+            idents.contains("saturating_add")
+                || idents.contains("saturating_sub")
+                || idents.contains("saturating_mul")
+                || idents.contains("saturating_div")
+        }
+        "SaturatedConversion" => {
+            idents.contains("saturated_into") || idents.contains("saturated_from")
+        }
+        "UniqueSaturatedInto" => idents.contains("unique_saturated_into"),
+        "Convert" => idents.contains("convert"),
+        "StaticLookup" => idents.contains("lookup"),
+        "Verify" => idents.contains("verify"),
+        "IdentifyAccount" => idents.contains("into_account"),
+        "AppKey" => idents.contains("ID"),
+        "OpaqueKeys" => idents.contains("key_ids"),
         _ => false,
     }
 }
@@ -738,6 +796,142 @@ pub fn rebase_use_for_subfile_with_local_roots(
             out.push_str(&use_src[end..]);
             out
         }
+    }
+}
+
+/// In an extracted inline-module body, rewrite `use super::name` paths that
+/// reference items moved to sibling sub-buckets.
+///
+/// For each entry in `name_to_bucket`, `super::name` becomes
+/// `super::bucket::name`.  Targets that stayed in the facade are **not**
+/// in the map, so their `super::name` paths are left untouched.
+pub fn rebase_super_use_for_cross_imports(
+    src: &str,
+    name_to_bucket: &std::collections::HashMap<String, String>,
+) -> String {
+    let Ok(mut file) = syn::parse_str::<syn::File>(src) else {
+        return src.to_string();
+    };
+    for item in &mut file.items {
+        let syn::Item::Use(use_item) = item else {
+            continue;
+        };
+        rebase_use_tree_super_for_cross_imports(&mut use_item.tree, name_to_bucket, false);
+    }
+    file.to_token_stream().to_string()
+}
+
+fn rebase_use_tree_super_for_cross_imports(
+    tree: &mut syn::UseTree,
+    name_to_bucket: &std::collections::HashMap<String, String>,
+    inside_super: bool,
+) {
+    match tree {
+        syn::UseTree::Name(name) => {
+            if inside_super {
+                if let Some(bucket) = name_to_bucket.get(&name.ident.to_string()) {
+                    let bucket_ident = syn::Ident::new(bucket, name.ident.span());
+                    let name_ident = name.ident.clone();
+                    *tree = syn::UseTree::Path(syn::UsePath {
+                        ident: bucket_ident,
+                        colon2_token: syn::token::PathSep::default(),
+                        tree: Box::new(syn::UseTree::Name(syn::UseName {
+                            ident: name_ident,
+                        })),
+                    });
+                }
+            }
+        }
+        syn::UseTree::Rename(rename) => {
+            if inside_super {
+                if let Some(bucket) = name_to_bucket.get(&rename.ident.to_string()) {
+                    let bucket_ident = syn::Ident::new(bucket, rename.ident.span());
+                    let name_ident = rename.ident.clone();
+                    let alias = rename.rename.clone();
+                    *tree = syn::UseTree::Path(syn::UsePath {
+                        ident: bucket_ident,
+                        colon2_token: syn::token::PathSep::default(),
+                        tree: Box::new(syn::UseTree::Rename(syn::UseRename {
+                            ident: name_ident,
+                            as_token: syn::token::As::default(),
+                            rename: alias,
+                        })),
+                    });
+                }
+            }
+        }
+        syn::UseTree::Path(path) => {
+            if path.ident == "super" {
+                match &mut *path.tree {
+                    syn::UseTree::Name(name) => {
+                        if let Some(bucket) = name_to_bucket.get(&name.ident.to_string()) {
+                            let bucket_ident =
+                                syn::Ident::new(bucket, name.ident.span());
+                            let name_ident = name.ident.clone();
+                            *path.tree = syn::UseTree::Path(syn::UsePath {
+                                ident: bucket_ident,
+                                colon2_token: syn::token::PathSep::default(),
+                                tree: Box::new(syn::UseTree::Name(syn::UseName {
+                                    ident: name_ident,
+                                })),
+                            });
+                        }
+                    }
+                    syn::UseTree::Rename(rename) => {
+                        if let Some(bucket) = name_to_bucket.get(&rename.ident.to_string()) {
+                            let bucket_ident =
+                                syn::Ident::new(bucket, rename.ident.span());
+                            let name_ident = rename.ident.clone();
+                            let alias = rename.rename.clone();
+                            *path.tree = syn::UseTree::Path(syn::UsePath {
+                                ident: bucket_ident,
+                                colon2_token: syn::token::PathSep::default(),
+                                tree: Box::new(syn::UseTree::Rename(syn::UseRename {
+                                    ident: name_ident,
+                                    as_token: syn::token::As::default(),
+                                    rename: alias,
+                                })),
+                            });
+                        }
+                    }
+                    syn::UseTree::Path(inner) => {
+                        let name = inner.ident.to_string();
+                        if let Some(bucket) = name_to_bucket.get(&name) {
+                            let bucket_ident =
+                                syn::Ident::new(bucket, inner.ident.span());
+                            let rest = std::mem::replace(
+                                &mut *inner.tree,
+                                syn::UseTree::Name(syn::UseName {
+                                    ident: inner.ident.clone(),
+                                }),
+                            );
+                            let new_inner = syn::UseTree::Path(syn::UsePath {
+                                ident: bucket_ident,
+                                colon2_token: syn::token::PathSep::default(),
+                                tree: Box::new(rest),
+                            });
+                            *path.tree = new_inner;
+                        } else {
+                            rebase_use_tree_super_for_cross_imports(&mut path.tree, name_to_bucket, true);
+                        }
+                    }
+                    syn::UseTree::Group(group) => {
+                        for item in &mut group.items {
+                            rebase_use_tree_super_for_cross_imports(item, name_to_bucket, true);
+                        }
+                    }
+                    syn::UseTree::Glob(_) => {}
+                }
+            } else {
+                rebase_use_tree_super_for_cross_imports(&mut path.tree, name_to_bucket, inside_super);
+            }
+        }
+        syn::UseTree::Group(group) => {
+            for item in &mut group.items {
+                rebase_use_tree_super_for_cross_imports(item, name_to_bucket, inside_super);
+            }
+        }
+        syn::UseTree::Glob(_) => {}
     }
 }
 
@@ -2062,5 +2256,119 @@ mod tests {
         );
 
         assert!(roots.contains("coreaudio"), "roots={roots:?}");
+    }
+
+    #[test]
+    fn quote_totokens_trait_survives_method_syntax() {
+        use crate::item::{ItemKind, ItemVis, ParsedItem};
+        use std::collections::HashSet;
+
+        let import = ParsedItem {
+            id: 0,
+            kind: ItemKind::Use,
+            name: String::new(),
+            vis: ItemVis::Private,
+            is_cfg_test: false,
+            line_start: 1,
+            line_end: 1,
+            source: "use quote::ToTokens;".to_string(),
+            refs: Vec::new(),
+        };
+        let idents = HashSet::from(["to_token_stream".to_string()]);
+
+        let rendered = render_uses_for(&[&import], &idents, &HashSet::new(), false);
+        assert!(rendered.contains("ToTokens"), "rendered={rendered}");
+    }
+
+    #[test]
+    fn inflector_trait_survives_method_syntax() {
+        use crate::item::{ItemKind, ItemVis, ParsedItem};
+        use std::collections::HashSet;
+
+        let import = ParsedItem {
+            id: 0,
+            kind: ItemKind::Use,
+            name: String::new(),
+            vis: ItemVis::Private,
+            is_cfg_test: false,
+            line_start: 1,
+            line_end: 1,
+            source: "use inflector::Inflector;".to_string(),
+            refs: Vec::new(),
+        };
+        let idents = HashSet::from(["to_snake_case".to_string()]);
+
+        let rendered = render_uses_for(&[&import], &idents, &HashSet::new(), false);
+        assert!(rendered.contains("Inflector"), "rendered={rendered}");
+    }
+
+    #[test]
+    fn thiserror_error_derive_macro_binding_survives_attribute_syntax() {
+        use crate::item::{ItemKind, ItemVis, ParsedItem};
+        use std::collections::HashSet;
+
+        let import = ParsedItem {
+            id: 0,
+            kind: ItemKind::Use,
+            name: String::new(),
+            vis: ItemVis::Private,
+            is_cfg_test: false,
+            line_start: 1,
+            line_end: 1,
+            source: "use thiserror::Error;".to_string(),
+            refs: Vec::new(),
+        };
+        let idents = HashSet::from(["error".to_string()]);
+
+        let rendered = render_uses_for(&[&import], &idents, &HashSet::new(), false);
+        assert!(rendered.contains("Error"), "rendered={rendered}");
+    }
+
+    #[test]
+    fn derive_more_from_macro_binding_survives_attribute_syntax() {
+        use crate::item::{ItemKind, ItemVis, ParsedItem};
+        use std::collections::HashSet;
+
+        let import = ParsedItem {
+            id: 0,
+            kind: ItemKind::Use,
+            name: String::new(),
+            vis: ItemVis::Private,
+            is_cfg_test: false,
+            line_start: 1,
+            line_end: 1,
+            source: "use derive_more::From;".to_string(),
+            refs: Vec::new(),
+        };
+        let idents = HashSet::from(["from".to_string()]);
+
+        let rendered = render_uses_for(&[&import], &idents, &HashSet::new(), false);
+        assert!(rendered.contains("From"), "rendered={rendered}");
+    }
+
+    #[test]
+    fn rebase_super_use_rewrites_cross_import_paths() {
+        use std::collections::HashMap;
+
+        let body = r#"
+use super::register_static;
+use super::with_function_context;
+use super::keep_me;
+use super::{register_static, with_function_context};
+pub use super::register_static;
+"#;
+        let map: HashMap<String, String> = HashMap::from([
+            ("register_static".to_string(), "impls".to_string()),
+            ("with_function_context".to_string(), "helpers".to_string()),
+        ]);
+        let out = rebase_super_use_for_cross_imports(body, &map);
+        assert!(out.contains("use super :: impls :: register_static"), "out={out}");
+        assert!(
+            out.contains("use super :: helpers :: with_function_context"),
+            "out={out}"
+        );
+        assert!(out.contains("use super :: keep_me"), "out={out}");
+        assert!(out.contains("use super :: { impls :: register_static , helpers :: with_function_context }"), "out={out}");
+        assert!(out.contains("pub use super :: impls :: register_static"), "out={out}");
     }
 }

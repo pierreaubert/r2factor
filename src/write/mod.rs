@@ -423,10 +423,23 @@ pub fn write_plan(
             reexport_modules.insert(module.clone());
         }
     }
+    let inline_facade_module_names: BTreeSet<String> = items
+        .iter()
+        .filter(|item| matches!(item.kind, ItemKind::Mod) && !item.is_external_mod_decl())
+        .filter_map(|item| {
+            let bucket = ctx.bucket_of.get(&item.id)?;
+            if bucket.as_str() == "mod_root" || bucket.as_str() == stem {
+                Some(item.name.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
     let local_module_roots: HashSet<String> = planned_files
         .iter()
         .chain(existing_modules.iter())
         .chain(explicit_external_modules.iter())
+        .chain(inline_facade_module_names.iter())
         .cloned()
         .collect();
 
@@ -1525,6 +1538,12 @@ fn force_facade_pinned_items(
                     stem,
                     *id,
                     "repr ABI item stays in facade for source-scanning codegen",
+                );
+            } else if item.is_docify_export() {
+                adjusted.assign(
+                    stem,
+                    *id,
+                    "docify export stays in facade so embed paths remain valid",
                 );
             } else {
                 adjusted

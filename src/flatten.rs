@@ -1185,27 +1185,14 @@ fn inline_content_ranges(
 }
 
 fn item_byte_range_for_mod_contents(src: &str, m: &syn::ItemMod) -> Result<(usize, usize)> {
-    let (item_start, item_end) = item_mod_byte_range(src, m)?;
-    let item_src = &src[item_start..item_end];
-    let open = item_src
-        .find('{')
-        .with_context(|| format!("inline mod `{}` has no opening brace", m.ident))?;
-    let close = item_src
-        .rfind('}')
-        .with_context(|| format!("inline mod `{}` has no closing brace", m.ident))?;
-    Ok((item_start + open + 1, item_start + close))
-}
-
-fn item_mod_byte_range(src: &str, m: &syn::ItemMod) -> Result<(usize, usize)> {
-    let start_span = m
-        .attrs
-        .iter()
-        .map(|a| a.span())
-        .next()
-        .unwrap_or_else(|| m.span());
-    let start = span_start(src, start_span).context("mod start span unavailable")?;
-    let end = span_end(src, m.span()).context("mod end span unavailable")?;
-    Ok(expand_to_line_bounds(src, start, end))
+    let (brace, _) = m.content.as_ref().context("not an inline module")?;
+    let open_start = brace.span.open().start();
+    let close_start = brace.span.close().start();
+    let open = line_col_to_byte_offset(src, open_start.line, open_start.column)
+        .with_context(|| format!("inline mod `{}` brace start span unavailable", m.ident))?;
+    let close = line_col_to_byte_offset(src, close_start.line, close_start.column)
+        .with_context(|| format!("inline mod `{}` brace end span unavailable", m.ident))?;
+    Ok((open + 1, close))
 }
 
 fn item_byte_range(src: &str, item: &syn::Item) -> Result<(usize, usize)> {

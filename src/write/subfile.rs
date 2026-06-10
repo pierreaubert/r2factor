@@ -1,7 +1,8 @@
 use crate::item::{ItemId, ItemKind, ParsedItem};
 use crate::promote::{
-    CrossImport, add_pub_crate, add_pub_super, add_pub_super_to_fields, lift_impl_methods,
-    rebase_body_super_for_subfile, rebase_pub_super_in_subfile,
+    CrossImport, add_pub_crate, add_pub_super, add_pub_super_to_fields,
+    lift_impl_methods, line_col_to_byte_offset, rebase_body_super_for_subfile,
+    rebase_pub_super_in_subfile,
 };
 use crate::write::proc_macro_entry;
 use crate::write::uses;
@@ -69,6 +70,17 @@ pub fn render_sub_file(
             if let Some(prefix) = include_path_prefix {
                 module_body = rebase_include_macro_paths(&module_body, prefix);
             }
+            // If items referenced via `use super::name;` inside this inline
+            // module were moved to sibling sub-buckets, rewrite those paths
+            // so they point through the correct sibling instead of the facade.
+            let name_to_bucket: std::collections::HashMap<String, String> = imports
+                .iter()
+                .filter_map(|ci| ci.source_bucket.as_ref().map(|b| (ci.name.clone(), b.clone())))
+                .collect();
+            if !name_to_bucket.is_empty() {
+                module_body =
+                    uses::rebase_super_use_for_cross_imports(&module_body, &name_to_bucket);
+            }
             buf.push_str(&module_body);
             buf.push_str("\n\n");
             continue;
@@ -121,17 +133,23 @@ pub fn render_sub_file(
 }
 
 fn add_bucket_scope_import_to_inline_module(src: &str) -> String {
-    if !is_inline_module_source(src) || src.contains("use super::*;") {
+    let Ok(file) = syn::parse_file(src) else {
+        return src.to_string();
+    };
+    let [syn::Item::Mod(module)] = file.items.as_slice() else {
+        return src.to_string();
+    };
+    if module.content.is_none() || src.contains("use super::*;") {
         return src.to_string();
     }
-    let Some(open) = src.find('{') else {
+    let Some((open, _close)) = module_brace_byte_offsets(src, module) else {
         return src.to_string();
     };
     let mut insert = open + 1;
     let after_open = &src[insert..];
     for line in after_open.split_inclusive('\n') {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with("#![") {
+        if trimmed.is_empty() || trimmed.starts_with("#![") || trimmed.starts_with("//!") {
             insert += line.len();
             continue;
         }
@@ -148,28 +166,26 @@ fn add_bucket_scope_import_to_inline_module(src: &str) -> String {
     out
 }
 
-fn is_inline_module_source(src: &str) -> bool {
-    let Ok(file) = syn::parse_file(src) else {
-        return false;
-    };
-    matches!(
-        file.items.as_slice(),
-        [syn::Item::Mod(module)] if module.content.is_some()
-    )
-}
-
 fn unwrap_inline_module_source(src: &str) -> Option<String> {
     let file = syn::parse_file(src).ok()?;
     let [syn::Item::Mod(module)] = file.items.as_slice() else {
         return None;
     };
     module.content.as_ref()?;
-    let open = src.find('{')?;
-    let close = src.rfind('}')?;
+    let (open, close) = module_brace_byte_offsets(src, module)?;
     if open >= close {
         return None;
     }
     Some(src[open + 1..close].trim_matches('\n').to_string())
+}
+
+fn module_brace_byte_offsets(src: &str, module: &syn::ItemMod) -> Option<(usize, usize)> {
+    let (brace, _) = module.content.as_ref()?;
+    let open_start = brace.span.open().start();
+    let close_start = brace.span.close().start();
+    let open = line_col_to_byte_offset(src, open_start.line, open_start.column)?;
+    let close = line_col_to_byte_offset(src, close_start.line, close_start.column)?;
+    Some((open, close))
 }
 
 fn rebase_include_macro_paths(src: &str, prefix: &str) -> String {
@@ -275,5 +291,113 @@ mod tests {
             attr_pos < import_pos,
             "bucket scope import should be inserted after inner attrs; got:\n{rendered}"
         );
+    }
+
+    #[test]
+    fn moved_inline_module_preserves_inner_doc_comments_before_import() {
+        let item = ParsedItem {
+            id: 0,
+            kind: ItemKind::Mod,
+            name: "nested".to_string(),
+            vis: ItemVis::Private,
+            is_cfg_test: false,
+            line_start: 1,
+            line_end: 6,
+            source: r#"mod nested {
+    //! Inner docs
+    //! more docs
+
+    pub fn call() -> u32 {
+        helper()
+    }
+}"#
+            .to_string(),
+            refs: Vec::new(),
+        };
+        let by_id = BTreeMap::from([(item.id, &item)]);
+
+        let rendered = render_sub_file(
+            "misc",
+            &[item.id],
+            &by_id,
+            "use super::helper;",
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &HashSet::new(),
+            None,
+        );
+
+        let doc_pos = rendered
+            .find("//! Inner docs")
+            .expect("inner doc in rendered source");
+        let import_pos = rendered
+            .find("use super::*;")
+            .expect("bucket scope import in rendered source");
+        assert!(
+            doc_pos < import_pos,
+            "bucket scope import should be inserted after inner docs; got:\n{rendered}"
+        );
+
+        // Must be valid Rust
+        syn::parse_file(&rendered).expect("rendered source must parse");
+    }
+
+    #[test]
+    fn moved_inline_module_with_brace_in_doc_comment_finds_correct_body_brace() {
+        // Regression test: doc comments can contain `{` in code examples.
+        // The old naive `src.find('{')` would find the brace inside the doc
+        // comment and inject `use super::*;` there, producing invalid syntax.
+        let item = ParsedItem {
+            id: 0,
+            kind: ItemKind::Mod,
+            name: "ensure".to_string(),
+            vis: ItemVis::Private,
+            is_cfg_test: false,
+            line_start: 1,
+            line_end: 10,
+            source: r##"pub(super) mod ensure {
+    /// ```
+    /// # use sp_arithmetic::{
+    ///     traits::EnsureSub, ArithmeticError};
+    /// ```
+    pub trait EnsureSub: EnsureSubAssign {
+        fn ensure_sub(self, rhs: Self) -> Result<Self, ArithmeticError>;
+    }
+}"##
+                .to_string(),
+            refs: Vec::new(),
+        };
+        let by_id = BTreeMap::from([(item.id, &item)]);
+
+        let rendered = render_sub_file(
+            "misc",
+            &[item.id],
+            &by_id,
+            "",
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &HashSet::new(),
+            None,
+        );
+
+        // The doc comment containing `{` must remain intact and the import
+        // must be injected inside the module body, not inside the doc comment.
+        assert!(
+            rendered.contains("traits::EnsureSub, ArithmeticError};"),
+            "doc comment must remain intact; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("use super::*;"),
+            "bucket scope import must be present; got:\n{rendered}"
+        );
+
+        // Must be valid Rust
+        syn::parse_file(&rendered).expect("rendered source must parse");
     }
 }

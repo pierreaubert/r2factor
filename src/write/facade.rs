@@ -93,11 +93,19 @@ pub fn render_facade(
 
     // Skip `pub use macros::*;` — `macro_rules!` are not items and aren't
     // re-exportable that way. They reach siblings via `#[macro_use]` above.
-    for m in sub_modules {
-        if m == "tests" || m == "macros" || !reexport_modules.contains(m) {
-            continue;
+    //
+    // Also skip wildcard re-exports entirely for proc-macro crates: a
+    // `proc-macro` crate type can only export functions tagged with
+    // `#[proc_macro]`, `#[proc_macro_derive]`, or `#[proc_macro_attribute]`.
+    // `pub use sub::*;` would re-export helpers and trigger E0457.
+    let is_proc_macro_crate = !proc_macro_exports.is_empty();
+    if !is_proc_macro_crate {
+        for m in sub_modules {
+            if m == "tests" || m == "macros" || !reexport_modules.contains(m) {
+                continue;
+            }
+            let _ = writeln!(buf, "pub use {m}::*;");
         }
-        let _ = writeln!(buf, "pub use {m}::*;");
     }
     if sub_modules
         .iter()
