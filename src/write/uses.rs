@@ -575,6 +575,16 @@ fn trait_method_hint_is_used(binding: &str, idents: &HashSet<String>) -> bool {
                 || idents.contains("output_delay")
                 || idents.contains("nbr_channels")
         }
+        "LinearOperator" => {
+            idents.contains("num_rows")
+                || idents.contains("num_cols")
+                || idents.contains("apply")
+                || idents.contains("apply_into")
+                || idents.contains("apply_transpose")
+                || idents.contains("apply_transpose_into")
+                || idents.contains("apply_hermitian")
+                || idents.contains("is_square")
+        }
         "Itertools" => {
             idents.contains("find_or_first")
                 || idents.contains("find_or_last")
@@ -1479,6 +1489,33 @@ mod tests {
         let rendered = render_uses_for(&[&write_use], &idents, &HashSet::new(), false);
 
         assert!(rendered.contains("Write"), "rendered={rendered}");
+    }
+
+    #[test]
+    fn linear_operator_trait_survives_apply_into_method_syntax() {
+        use crate::item::{ItemKind, ItemVis, ParsedItem};
+        use std::collections::HashSet;
+
+        let solver_use = ParsedItem {
+            id: 0,
+            kind: ItemKind::Use,
+            name: String::new(),
+            vis: ItemVis::Private,
+            is_cfg_test: false,
+            line_start: 1,
+            line_end: 1,
+            source: "use sonium_solvers::{CsrMatrix, LinearOperator};".to_string(),
+            refs: Vec::new(),
+        };
+        let idents = HashSet::from([
+            "CsrMatrix".to_string(),
+            "operator".to_string(),
+            "apply_into".to_string(),
+        ]);
+
+        let rendered = render_uses_for(&[&solver_use], &idents, &HashSet::new(), false);
+
+        assert!(rendered.contains("LinearOperator"), "rendered={rendered}");
     }
 
     #[test]
