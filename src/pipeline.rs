@@ -98,7 +98,7 @@ fn run_split_dir(root: &Path, opts: &SplitOptions, emit: bool) -> Result<()> {
 }
 
 fn verify_file_split_if_package(file: &Path, tree: &SplitWriteTree, emit: bool) -> Result<()> {
-    if verify::locate_package_manifest(file).is_none() {
+    let Some(manifest) = verify::locate_package_manifest(file) else {
         if emit {
             eprintln!(
                 "[check] skipped: no Cargo.toml with [package] found above {}",
@@ -106,8 +106,8 @@ fn verify_file_split_if_package(file: &Path, tree: &SplitWriteTree, emit: bool) 
             );
         }
         return Ok(());
-    }
-    verify::verify_split_with_rollback(file, tree)?;
+    };
+    verify::verify_split_with_manifest_and_rollback(file, &manifest, tree)?;
     Ok(())
 }
 

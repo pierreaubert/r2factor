@@ -83,6 +83,17 @@ pub fn verify_split_with_rollback(file: &Path, tree: &SplitWriteTree) -> Result<
     }
 }
 
+pub fn verify_split_with_manifest_and_rollback(
+    file: &Path,
+    manifest: &Path,
+    tree: &SplitWriteTree,
+) -> Result<CargoVerifyReport> {
+    match run_cargo_verification_with_manifest(manifest) {
+        Ok(report) => Ok(report),
+        Err(failure) => fail_with_rollback_report(file, std::slice::from_ref(tree), *failure),
+    }
+}
+
 pub fn fail_with_rollback_report(
     file: &Path,
     trees: &[SplitWriteTree],
@@ -160,6 +171,13 @@ fn run_cargo_verification(
             ),
         ))
     })?;
+    run_cargo_verification_with_manifest(&manifest)
+}
+
+fn run_cargo_verification_with_manifest(
+    manifest: &Path,
+) -> std::result::Result<CargoVerifyReport, Box<CargoVerifyFailure>> {
+    let manifest = manifest.to_path_buf();
     let commands = vec![
         CargoInvocation::new("check", &manifest),
         CargoInvocation::new("clippy", &manifest),
@@ -634,6 +652,36 @@ mod tests {
         std::fs::write(&src, "").expect("write src");
 
         assert_eq!(locate_package_manifest(&src), None);
+    }
+
+    #[test]
+    fn cargo_verification_preserves_pre_resolved_manifest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manifest = tmp.path().join("Cargo.toml");
+        std::fs::write(&manifest, "not valid toml").expect("write invalid manifest");
+
+        let failure =
+            run_cargo_verification_with_manifest(&manifest).expect_err("cargo check should fail");
+
+        assert_eq!(failure.manifest.as_deref(), Some(manifest.as_path()));
+        assert_eq!(
+            failure.failed.argv,
+            vec![
+                "cargo",
+                "check",
+                "--manifest-path",
+                manifest.to_str().expect("utf-8 temp path"),
+            ]
+        );
+        assert_ne!(failure.failed.status, "not run");
+        assert!(
+            !failure
+                .failed
+                .stderr
+                .contains("could not find a Cargo.toml with [package]"),
+            "{}",
+            failure.failed.stderr
+        );
     }
 
     #[test]
