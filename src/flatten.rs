@@ -370,10 +370,14 @@ impl<'ast> Visit<'ast> for PathRewriteVisitor<'_> {
     }
 
     fn visit_arm(&mut self, node: &'ast syn::Arm) {
-        self.visit_pat(&node.pat);
+        let (pat, guard) = match &node.pat {
+            syn::Pat::Guard(guard) => (&*guard.pat, Some(&*guard.guard)),
+            pat => (pat, None),
+        };
+        self.visit_pat(pat);
         let saved = self.local_bindings.len();
-        self.collect_pat_bindings(&node.pat);
-        if let Some((_, guard)) = &node.guard {
+        self.collect_pat_bindings(pat);
+        if let Some(guard) = guard {
             self.visit_expr(guard);
         }
         self.visit_expr(&node.body);

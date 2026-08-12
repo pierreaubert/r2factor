@@ -38,6 +38,7 @@ pub fn generate_facade_many(
 
     Ok(syn::File {
         shebang: None,
+        frontmatter: None,
         attrs: Vec::new(),
         items,
     })

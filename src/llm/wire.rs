@@ -47,21 +47,23 @@ struct ChatResponseMessage {
 /// raw `content` string. The caller is responsible for extracting / parsing
 /// JSON from the content — local models often wrap it in prose or fences.
 pub fn send_chat(cfg: &LlmConfig, req: &ChatRequest<'_>) -> Result<String> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(cfg.timeout_secs))
-        .build();
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(cfg.timeout_secs)))
+        .build()
+        .into();
     let mut req_builder = agent
         .post(&cfg.endpoint)
-        .set("content-type", "application/json");
+        .header("content-type", "application/json");
     if let Some(key) = cfg.api_key.as_deref()
         && !key.is_empty()
     {
-        req_builder = req_builder.set("authorization", &format!("Bearer {key}"));
+        req_builder = req_builder.header("authorization", &format!("Bearer {key}"));
     }
     let resp: ChatResponse = req_builder
         .send_json(serde_json::to_value(req)?)
         .with_context(|| format!("POST {}", cfg.endpoint))?
-        .into_json()
+        .body_mut()
+        .read_json()
         .context("decode chat response")?;
     Ok(resp
         .choices

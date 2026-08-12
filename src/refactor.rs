@@ -603,21 +603,23 @@ fn advisor_evidence_summary(symbols: &SymbolGraph) -> AdvisorEvidenceSummary {
 }
 
 fn send_llm_request(cfg: &LlmConfig, body: serde_json::Value) -> Result<String> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(cfg.timeout_secs))
-        .build();
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(cfg.timeout_secs)))
+        .build()
+        .into();
     let mut request = agent
         .post(&cfg.endpoint)
-        .set("content-type", "application/json");
+        .header("content-type", "application/json");
     if let Some(key) = cfg.api_key.as_deref()
         && !key.is_empty()
     {
-        request = request.set("authorization", &format!("Bearer {key}"));
+        request = request.header("authorization", &format!("Bearer {key}"));
     }
     let response: serde_json::Value = request
         .send_json(body)
         .with_context(|| format!("POST {}", cfg.endpoint))?
-        .into_json()
+        .body_mut()
+        .read_json()
         .context("decode local LLM response")?;
     response["choices"][0]["message"]["content"]
         .as_str()

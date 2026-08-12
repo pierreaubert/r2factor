@@ -229,7 +229,7 @@ fn item_kind_and_name(item: &Item) -> (ItemKind, String) {
         Item::ForeignMod(_) => (ItemKind::ForeignMod, String::new()),
         Item::Impl(i) => {
             let self_ty = type_to_anchor(&i.self_ty);
-            let trait_path = i.trait_.as_ref().map(|(_, path, _)| path_to_string(path));
+            let trait_path = i.trait_.as_ref().map(|(path, _)| path_to_string(path));
             let name = match &trait_path {
                 Some(t) => format!("impl {t} for {self_ty}"),
                 None => format!("impl {self_ty}"),
@@ -315,9 +315,7 @@ fn is_test_attr(attr: &Attribute) -> bool {
 
 fn is_docify_export_attr(attr: &Attribute) -> bool {
     let segs: Vec<_> = attr.path().segments.iter().collect();
-    segs.len() == 2
-        && segs[0].ident == "docify"
-        && segs[1].ident == "export"
+    segs.len() == 2 && segs[0].ident == "docify" && segs[1].ident == "export"
 }
 
 fn type_to_anchor(ty: &Type) -> String {

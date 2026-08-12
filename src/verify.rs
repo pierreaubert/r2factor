@@ -186,7 +186,7 @@ fn run_cargo_verification_with_manifest(
     let mut completed = Vec::new();
     for invocation in commands {
         eprintln!("[verify] running {}", invocation.display());
-        let output = invocation.command().output().map_err(|err| {
+        let output = run_cargo_invocation(&invocation).map_err(|err| {
             Box::new(CargoVerifyFailure::for_launch_error(
                 Some(manifest.clone()),
                 completed.clone(),
@@ -212,6 +212,139 @@ fn run_cargo_verification_with_manifest(
         manifest,
         commands: completed,
     })
+}
+
+/// Run Cargo, working around a partially materialized worktree only when
+/// Cargo itself identifies an absent workspace member. Cargo resolves every
+/// workspace member before selecting the requested package, so an unrelated
+/// missing member would otherwise prevent verification altogether.
+///
+/// The placeholders exist only while the command runs. They intentionally do
+/// not mask missing dependencies or compiler errors: those occur after Cargo
+/// has loaded the workspace and still fail verification normally.
+fn run_cargo_invocation(invocation: &CargoInvocation) -> io::Result<Output> {
+    let mut placeholders = Vec::new();
+    loop {
+        let output = invocation.command().output()?;
+        if output.status.success() {
+            return Ok(output);
+        }
+        let Some(manifest) = missing_workspace_member_manifest(&output.stderr) else {
+            return Ok(output);
+        };
+        match WorkspaceMemberPlaceholder::create(&manifest, placeholders.len()) {
+            Ok(placeholder) => {
+                eprintln!(
+                    "[verify] temporarily supplying missing workspace member {}",
+                    manifest.display()
+                );
+                placeholders.push(placeholder);
+            }
+            Err(err) => {
+                eprintln!(
+                    "[verify] could not supply missing workspace member {}: {err}",
+                    manifest.display()
+                );
+                return Ok(output);
+            }
+        }
+    }
+}
+
+fn missing_workspace_member_manifest(stderr: &[u8]) -> Option<PathBuf> {
+    let stderr = String::from_utf8_lossy(stderr);
+    let prefix = "error: failed to load manifest for workspace member `";
+    let start = stderr.find(prefix)? + prefix.len();
+    let end = start + stderr[start..].find('`')?;
+    let member = PathBuf::from(&stderr[start..end]);
+    let manifest = member.join("Cargo.toml");
+    let expected_read = format!("failed to read `{}`", manifest.display());
+    if stderr.contains(&expected_read)
+        && stderr.contains("No such file or directory")
+        && !manifest.exists()
+    {
+        Some(manifest)
+    } else {
+        None
+    }
+}
+
+struct WorkspaceMemberPlaceholder {
+    files: Vec<PathBuf>,
+    dirs: Vec<PathBuf>,
+}
+
+impl WorkspaceMemberPlaceholder {
+    fn create(manifest: &Path, sequence: usize) -> io::Result<Self> {
+        let member_dir = manifest.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "workspace member manifest has no parent",
+            )
+        })?;
+        let src_dir = member_dir.join("src");
+        let mut placeholder = Self {
+            files: Vec::new(),
+            dirs: Vec::new(),
+        };
+        placeholder.create_dir_all(member_dir)?;
+        placeholder.create_dir_all(&src_dir)?;
+        placeholder.create_file(
+            manifest,
+            &format!(
+                "[package]\nname = \"r2factor-workspace-placeholder-{sequence}\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n"
+            ),
+        )?;
+        placeholder.create_file(
+            &src_dir.join("lib.rs"),
+            "// Temporary r2factor verifier placeholder.\n",
+        )?;
+        Ok(placeholder)
+    }
+
+    fn create_dir_all(&mut self, dir: &Path) -> io::Result<()> {
+        if dir.exists() {
+            return Ok(());
+        }
+        let parent = dir.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "directory has no parent")
+        })?;
+        self.create_dir_all(parent)?;
+        match fs::create_dir(dir) {
+            Ok(()) => self.dirs.push(dir.to_path_buf()),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err),
+        }
+        Ok(())
+    }
+
+    fn create_file(&mut self, path: &Path, contents: &str) -> io::Result<()> {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(mut file) => {
+                use std::io::Write as _;
+                file.write_all(contents.as_bytes())?;
+                self.files.push(path.to_path_buf());
+                Ok(())
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+}
+
+impl Drop for WorkspaceMemberPlaceholder {
+    fn drop(&mut self) {
+        for file in self.files.iter().rev() {
+            let _ = fs::remove_file(file);
+        }
+        for dir in self.dirs.iter().rev() {
+            let _ = fs::remove_dir(dir);
+        }
+    }
 }
 
 pub fn rollback_split_tree(tree: &SplitWriteTree) -> SplitRollbackReport {
@@ -690,6 +823,55 @@ mod tests {
         assert_eq!(
             invocation.argv_strings(),
             vec!["cargo", "check", "--manifest-path", "/tmp/demo/Cargo.toml"]
+        );
+    }
+
+    #[test]
+    fn cargo_verification_supplies_and_removes_missing_workspace_member() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let app = tmp.path().join("app");
+        fs::create_dir_all(app.join("src")).expect("mkdir app source");
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\", \"missing-member\"]\nresolver = \"3\"\n",
+        )
+        .expect("write workspace manifest");
+        let manifest = app.join("Cargo.toml");
+        fs::write(
+            &manifest,
+            "[package]\nname = \"verification-app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .expect("write app manifest");
+        fs::write(app.join("src/lib.rs"), "pub fn answer() -> u8 { 42 }\n")
+            .expect("write app source");
+
+        let report = run_cargo_verification_with_manifest(&manifest)
+            .expect("verification should tolerate an absent workspace member");
+
+        assert_eq!(report.commands.len(), 2);
+        assert!(
+            !tmp.path().join("missing-member").exists(),
+            "temporary workspace member should be removed"
+        );
+    }
+
+    #[test]
+    fn missing_workspace_member_manifest_rejects_unrelated_missing_files() {
+        let member = Path::new("/tmp/workspace/member");
+        let stderr = format!(
+            "error: failed to load manifest for workspace member `{}`\nCaused by:\n  failed to read `{}`\n\nCaused by:\n  No such file or directory (os error 2)\n",
+            member.display(),
+            member.join("Cargo.toml").display(),
+        );
+        assert_eq!(
+            missing_workspace_member_manifest(stderr.as_bytes()),
+            Some(member.join("Cargo.toml"))
+        );
+        assert_eq!(
+            missing_workspace_member_manifest(
+                b"error: failed to read `Cargo.toml`: No such file or directory"
+            ),
+            None
         );
     }
 

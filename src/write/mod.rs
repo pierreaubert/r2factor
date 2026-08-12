@@ -181,6 +181,102 @@ impl SplitLayout {
     }
 }
 
+fn existing_sibling_super_imports(target_dir: &Path, layout: &SplitLayout) -> BTreeSet<String> {
+    let mut imports = BTreeSet::new();
+    let Ok(entries) = fs::read_dir(target_dir) else {
+        return imports;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !layout.includes_existing_module_file(&path) {
+            continue;
+        }
+        let Ok(source) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(file) = syn::parse_file(&source) else {
+            continue;
+        };
+        for item in file.items {
+            let syn::Item::Use(item) = item else {
+                continue;
+            };
+            direct_super_use_bindings(&item.tree, &mut imports);
+        }
+    }
+    imports
+}
+
+fn direct_super_use_bindings(tree: &syn::UseTree, out: &mut BTreeSet<String>) {
+    match tree {
+        syn::UseTree::Path(path) if path.ident == "super" => {
+            direct_super_use_tail_bindings(&path.tree, out);
+        }
+        syn::UseTree::Group(group) => {
+            for tree in &group.items {
+                direct_super_use_bindings(tree, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn direct_super_use_tail_bindings(tree: &syn::UseTree, out: &mut BTreeSet<String>) {
+    match tree {
+        syn::UseTree::Name(name) => {
+            out.insert(name.ident.to_string());
+        }
+        syn::UseTree::Rename(rename) => {
+            out.insert(rename.ident.to_string());
+        }
+        syn::UseTree::Group(group) => {
+            for tree in &group.items {
+                direct_super_use_tail_bindings(tree, out);
+            }
+        }
+        // `use super::nested::Thing` is a reference to the `nested` module,
+        // not a facade-level item named `Thing`; leave it unchanged.
+        syn::UseTree::Path(_) | syn::UseTree::Glob(_) => {}
+    }
+}
+
+fn add_existing_sibling_facade_imports(
+    promote: &mut BTreeSet<ItemId>,
+    facade_imports: &mut BTreeSet<CrossImport>,
+    ctx: &RefContext<'_>,
+    stem: &str,
+    imported_names: &BTreeSet<String>,
+) {
+    for name in imported_names {
+        let Some(ids) = ctx.name_to_ids.get(name.as_str()) else {
+            continue;
+        };
+        // An unqualified sibling import can only be retained safely when it
+        // identified exactly one source item before the split. Ambiguous
+        // names already require user-side qualification, so don't invent a
+        // potentially different binding in the generated facade.
+        if ids.len() != 1 {
+            continue;
+        }
+        let id = ids[0];
+        let Some(bucket) = ctx.bucket_of.get(&id) else {
+            continue;
+        };
+        if bucket.as_str() == "mod_root" || bucket.as_str() == stem {
+            continue;
+        }
+        let item = ctx.by_id[&id];
+        if item.vis == ItemVis::Private && needs_keyword_rewrite(item) {
+            promote.insert(id);
+        }
+        facade_imports.insert(CrossImport {
+            source_bucket: Some((*bucket).clone()),
+            name: item.name.clone(),
+            cfg_attrs: cfg_attrs_of(&item.source),
+        });
+    }
+}
+
 fn is_binary_crate_root_like(parent: &Path, file_name: &str) -> bool {
     if file_name == "build.rs" {
         return true;
@@ -245,6 +341,11 @@ pub fn write_plan(
         );
     }
     let target_dir = layout.target_dir.clone();
+    // A sibling module already living in the target directory can refer to
+    // private names from this file via `use super::{name};`. Those names are
+    // not present in the split input's reference graph, so retain the
+    // sibling-facing facade bindings explicitly before moving their owners.
+    let existing_sibling_imports = existing_sibling_super_imports(&target_dir, &layout);
 
     // 1) Backup FIRST. If this fails, we abort with no destruction.
     let backup = make_backup_path(original)?;
@@ -269,7 +370,14 @@ pub fn write_plan(
     let ctx = RefContext::new(plan, items);
     let mut promote: BTreeSet<ItemId> = compute_promotions(&ctx, items, stem);
     let cross_imports = compute_cross_imports(&ctx, items, &promote, stem);
-    let facade_imports = compute_facade_imports(&ctx, items, &promote, stem);
+    let mut facade_imports = compute_facade_imports(&ctx, items, &promote, stem);
+    add_existing_sibling_facade_imports(
+        &mut promote,
+        &mut facade_imports,
+        &ctx,
+        stem,
+        &existing_sibling_imports,
+    );
     // Inherent-impl blocks for promoted types: rewrite associated items
     // (fn/const/type) to `pub(super)` so cross-bucket `Type::method()`
     // calls resolve. Without this, E0624 ("associated function ... is
@@ -1628,4 +1736,68 @@ fn rename_facade_imports(
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preserves_private_helpers_imported_by_existing_sibling_module() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let original = tmp.path().join("sample.rs");
+        let source = "fn tet_edges() {}\nfn tet_faces() {}\n";
+        fs::write(&original, source).expect("write source");
+        let target = tmp.path().join("sample");
+        fs::create_dir_all(&target).expect("mkdir target");
+        fs::write(
+            target.join("recovery.rs"),
+            "use super::{tet_edges, tet_faces};\nfn use_helpers() { tet_edges(); tet_faces(); }\n",
+        )
+        .expect("write sibling");
+
+        let items = crate::item::parse_file(source).expect("parse source");
+        let mut plan = Plan::default();
+        for item in &items {
+            plan.assign("tet", item.id, "test helper bucket");
+        }
+
+        write_plan(
+            &original,
+            &plan,
+            &items,
+            &WriteOptions {
+                force: false,
+                recursive_max_lines: None,
+            },
+        )
+        .expect("write split");
+
+        let facade = fs::read_to_string(&original).expect("read facade");
+        assert!(facade.contains("use tet::tet_edges;"), "facade={facade}");
+        assert!(facade.contains("use tet::tet_faces;"), "facade={facade}");
+        let helpers = fs::read_to_string(target.join("tet.rs")).expect("read helper module");
+        assert!(
+            helpers.contains("pub(super) fn tet_edges"),
+            "helpers={helpers}"
+        );
+        assert!(
+            helpers.contains("pub(super) fn tet_faces"),
+            "helpers={helpers}"
+        );
+    }
+
+    #[test]
+    fn sibling_import_scan_ignores_nested_super_paths() {
+        let mut found = BTreeSet::new();
+        let parsed = syn::parse_str::<syn::ItemUse>(
+            "use super::{direct, nested::not_direct, other as renamed};",
+        )
+        .expect("parse import");
+        direct_super_use_bindings(&parsed.tree, &mut found);
+        assert_eq!(
+            found,
+            BTreeSet::from(["direct".to_string(), "other".to_string()])
+        );
+    }
 }

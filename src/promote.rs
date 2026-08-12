@@ -847,8 +847,10 @@ fn fn_keyword_span(sig: &syn::Signature) -> proc_macro2::Span {
     if let Some(a) = &sig.asyncness {
         return a.span;
     }
-    if let Some(u) = &sig.unsafety {
-        return u.span;
+    match &sig.safety {
+        syn::Safety::Safe(s) => return s.span,
+        syn::Safety::Unsafe(u) => return u.span,
+        syn::Safety::Default => {}
     }
     if let Some(abi) = &sig.abi {
         return abi.extern_token.span;
@@ -860,7 +862,7 @@ fn trait_keyword_span(t: &syn::ItemTrait) -> proc_macro2::Span {
     if let Some(u) = &t.unsafety {
         return u.span;
     }
-    if let Some(at) = &t.auto_token {
+    if let Some(at) = &t.modifiers.auto_token {
         return at.span;
     }
     t.trait_token.span

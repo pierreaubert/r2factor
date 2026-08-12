@@ -1,8 +1,7 @@
 use crate::item::{ItemId, ItemKind, ParsedItem};
 use crate::promote::{
-    CrossImport, add_pub_crate, add_pub_super, add_pub_super_to_fields,
-    lift_impl_methods, line_col_to_byte_offset, rebase_body_super_for_subfile,
-    rebase_pub_super_in_subfile,
+    CrossImport, add_pub_crate, add_pub_super, add_pub_super_to_fields, lift_impl_methods,
+    line_col_to_byte_offset, rebase_body_super_for_subfile, rebase_pub_super_in_subfile,
 };
 use crate::write::proc_macro_entry;
 use crate::write::uses;
@@ -75,7 +74,11 @@ pub fn render_sub_file(
             // so they point through the correct sibling instead of the facade.
             let name_to_bucket: std::collections::HashMap<String, String> = imports
                 .iter()
-                .filter_map(|ci| ci.source_bucket.as_ref().map(|b| (ci.name.clone(), b.clone())))
+                .filter_map(|ci| {
+                    ci.source_bucket
+                        .as_ref()
+                        .map(|b| (ci.name.clone(), b.clone()))
+                })
                 .collect();
             if !name_to_bucket.is_empty() {
                 module_body =
@@ -367,7 +370,7 @@ mod tests {
         fn ensure_sub(self, rhs: Self) -> Result<Self, ArithmeticError>;
     }
 }"##
-                .to_string(),
+            .to_string(),
             refs: Vec::new(),
         };
         let by_id = BTreeMap::from([(item.id, &item)]);

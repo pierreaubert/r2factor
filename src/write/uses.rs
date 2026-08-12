@@ -717,10 +717,7 @@ fn trait_method_hint_is_used(binding: &str, idents: &HashSet<String>) -> bool {
                 || idents.contains("from_ss58check_with_version")
                 || idents.contains("to_ss58check_with_version")
         }
-        "CryptoBytes" => {
-            idents.contains("to_ss58check")
-                || idents.contains("from_ss58check")
-        }
+        "CryptoBytes" => idents.contains("to_ss58check") || idents.contains("from_ss58check"),
         "Decode" => idents.contains("decode"),
         "One" => idents.contains("one") || idents.contains("is_one"),
         "Bounded" => idents.contains("min_value") || idents.contains("max_value"),
@@ -845,9 +842,7 @@ fn rebase_use_tree_super_for_cross_imports(
                     *tree = syn::UseTree::Path(syn::UsePath {
                         ident: bucket_ident,
                         colon2_token: syn::token::PathSep::default(),
-                        tree: Box::new(syn::UseTree::Name(syn::UseName {
-                            ident: name_ident,
-                        })),
+                        tree: Box::new(syn::UseTree::Name(syn::UseName { ident: name_ident })),
                     });
                 }
             }
@@ -875,8 +870,7 @@ fn rebase_use_tree_super_for_cross_imports(
                 match &mut *path.tree {
                     syn::UseTree::Name(name) => {
                         if let Some(bucket) = name_to_bucket.get(&name.ident.to_string()) {
-                            let bucket_ident =
-                                syn::Ident::new(bucket, name.ident.span());
+                            let bucket_ident = syn::Ident::new(bucket, name.ident.span());
                             let name_ident = name.ident.clone();
                             *path.tree = syn::UseTree::Path(syn::UsePath {
                                 ident: bucket_ident,
@@ -889,8 +883,7 @@ fn rebase_use_tree_super_for_cross_imports(
                     }
                     syn::UseTree::Rename(rename) => {
                         if let Some(bucket) = name_to_bucket.get(&rename.ident.to_string()) {
-                            let bucket_ident =
-                                syn::Ident::new(bucket, rename.ident.span());
+                            let bucket_ident = syn::Ident::new(bucket, rename.ident.span());
                             let name_ident = rename.ident.clone();
                             let alias = rename.rename.clone();
                             *path.tree = syn::UseTree::Path(syn::UsePath {
@@ -907,8 +900,7 @@ fn rebase_use_tree_super_for_cross_imports(
                     syn::UseTree::Path(inner) => {
                         let name = inner.ident.to_string();
                         if let Some(bucket) = name_to_bucket.get(&name) {
-                            let bucket_ident =
-                                syn::Ident::new(bucket, inner.ident.span());
+                            let bucket_ident = syn::Ident::new(bucket, inner.ident.span());
                             let rest = std::mem::replace(
                                 &mut *inner.tree,
                                 syn::UseTree::Name(syn::UseName {
@@ -922,7 +914,11 @@ fn rebase_use_tree_super_for_cross_imports(
                             });
                             *path.tree = new_inner;
                         } else {
-                            rebase_use_tree_super_for_cross_imports(&mut path.tree, name_to_bucket, true);
+                            rebase_use_tree_super_for_cross_imports(
+                                &mut path.tree,
+                                name_to_bucket,
+                                true,
+                            );
                         }
                     }
                     syn::UseTree::Group(group) => {
@@ -933,7 +929,11 @@ fn rebase_use_tree_super_for_cross_imports(
                     syn::UseTree::Glob(_) => {}
                 }
             } else {
-                rebase_use_tree_super_for_cross_imports(&mut path.tree, name_to_bucket, inside_super);
+                rebase_use_tree_super_for_cross_imports(
+                    &mut path.tree,
+                    name_to_bucket,
+                    inside_super,
+                );
             }
         }
         syn::UseTree::Group(group) => {
@@ -2399,13 +2399,24 @@ pub use super::register_static;
             ("with_function_context".to_string(), "helpers".to_string()),
         ]);
         let out = rebase_super_use_for_cross_imports(body, &map);
-        assert!(out.contains("use super :: impls :: register_static"), "out={out}");
+        assert!(
+            out.contains("use super :: impls :: register_static"),
+            "out={out}"
+        );
         assert!(
             out.contains("use super :: helpers :: with_function_context"),
             "out={out}"
         );
         assert!(out.contains("use super :: keep_me"), "out={out}");
-        assert!(out.contains("use super :: { impls :: register_static , helpers :: with_function_context }"), "out={out}");
-        assert!(out.contains("pub use super :: impls :: register_static"), "out={out}");
+        assert!(
+            out.contains(
+                "use super :: { impls :: register_static , helpers :: with_function_context }"
+            ),
+            "out={out}"
+        );
+        assert!(
+            out.contains("pub use super :: impls :: register_static"),
+            "out={out}"
+        );
     }
 }
