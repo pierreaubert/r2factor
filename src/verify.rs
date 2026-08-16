@@ -181,6 +181,8 @@ fn run_cargo_verification_with_manifest(
     let commands = vec![
         CargoInvocation::new("check", &manifest),
         CargoInvocation::new("clippy", &manifest),
+        CargoInvocation::new("test", &manifest),
+        CargoInvocation::new_with_args("doc", vec!["--no-deps"], &manifest),
     ];
 
     let mut completed = Vec::new();
@@ -614,13 +616,19 @@ fn manifest_has_package(manifest: &Path) -> bool {
 
 struct CargoInvocation {
     subcommand: &'static str,
+    args: Vec<String>,
     manifest: PathBuf,
 }
 
 impl CargoInvocation {
     fn new(subcommand: &'static str, manifest: &Path) -> Self {
+        Self::new_with_args(subcommand, Vec::new(), manifest)
+    }
+
+    fn new_with_args(subcommand: &'static str, args: Vec<&str>, manifest: &Path) -> Self {
         Self {
             subcommand,
+            args: args.into_iter().map(str::to_string).collect(),
             manifest: manifest.to_path_buf(),
         }
     }
@@ -629,6 +637,7 @@ impl CargoInvocation {
         let mut command = Command::new("cargo");
         command
             .arg(self.subcommand)
+            .args(&self.args)
             .arg("--manifest-path")
             .arg(&self.manifest);
         command
@@ -639,12 +648,14 @@ impl CargoInvocation {
     }
 
     fn argv_strings(&self) -> Vec<String> {
-        vec![
-            "cargo".to_string(),
-            self.subcommand.to_string(),
-            "--manifest-path".to_string(),
-            self.manifest.display().to_string(),
-        ]
+        std::iter::once("cargo".to_string())
+            .chain(std::iter::once(self.subcommand.to_string()))
+            .chain(self.args.iter().cloned())
+            .chain([
+                "--manifest-path".to_string(),
+                self.manifest.display().to_string(),
+            ])
+            .collect()
     }
 }
 
@@ -848,7 +859,7 @@ mod tests {
         let report = run_cargo_verification_with_manifest(&manifest)
             .expect("verification should tolerate an absent workspace member");
 
-        assert_eq!(report.commands.len(), 2);
+        assert_eq!(report.commands.len(), 4);
         assert!(
             !tmp.path().join("missing-member").exists(),
             "temporary workspace member should be removed"

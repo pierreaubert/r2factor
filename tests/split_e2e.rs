@@ -2965,8 +2965,12 @@ edition = "2024"
         "stderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("cargo test -p demo"),
-        "stderr should suggest full test report:\n{stderr}"
+        stderr.contains("[test] cargo test -p demo ok"),
+        "stderr should report the test verification:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("[doc] cargo doc --no-deps -p demo ok"),
+        "stderr should report the documentation verification:\n{stderr}"
     );
 }
 
@@ -3016,8 +3020,8 @@ edition = "2024"
         "stderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("[test] not run: cargo check failed; after fixing, run `cargo test -p demo` for a full test report"),
-        "stderr should suggest full test report after check failure:\n{stderr}"
+        stderr.contains("[check] cargo check -p demo failed"),
+        "stderr:\n{stderr}"
     );
     assert!(
         stderr.contains("[verify] bug report ->"),

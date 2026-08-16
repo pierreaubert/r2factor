@@ -388,42 +388,45 @@ fn verify_directory_split(
         .unwrap_or_else(|| root.to_path_buf());
     let packages = affected_packages(&workspace_root, changed_files)?;
     if packages.is_empty() {
-        if let Err(failure) = run_cargo_report(&workspace_root, &manifest, &["check"]) {
-            eprintln!(
-                "[test] not run: cargo check failed; after fixing, run `cargo test` for a full test report"
-            );
-            let reports = verify::fail_with_rollback_reports(root, trees, vec![*failure])?;
+        let mut failures = Vec::new();
+        for args in [vec!["check"], vec!["test"], vec!["doc", "--no-deps"]] {
+            if let Err(failure) = run_cargo_report(&workspace_root, &manifest, &args) {
+                failures.push(*failure);
+                break;
+            }
+        }
+        if !failures.is_empty() {
+            let reports = verify::fail_with_rollback_reports(root, trees, failures)?;
             anyhow::bail!(
-                "[check] cargo check failed; wrote {} bug report(s): {}",
+                "[verify] cargo verification failed; wrote {} bug report(s): {}",
                 reports.bug_reports.len(),
                 display_paths(&reports.bug_reports)
             );
         }
-        eprintln!("[test] skipped: run `cargo test` for a full test report");
         return Ok(());
     }
-    let package_list = test_report_commands(&packages);
     let mut failures = Vec::new();
     for package in &packages {
-        if let Err(failure) =
-            run_cargo_report(&workspace_root, &manifest, &["check", "-p", package])
-        {
-            eprintln!(
-                "[test] not run: cargo check failed; after fixing, run {package_list} for a full test report"
-            );
-            failures.push(*failure);
+        for args in [
+            vec!["check", "-p", package.as_str()],
+            vec!["test", "-p", package.as_str()],
+            vec!["doc", "--no-deps", "-p", package.as_str()],
+        ] {
+            if let Err(failure) = run_cargo_report(&workspace_root, &manifest, &args) {
+                failures.push(*failure);
+                break;
+            }
         }
     }
     if !failures.is_empty() {
         let reports = verify::fail_with_rollback_reports(root, trees, failures)?;
         anyhow::bail!(
-            "[check] cargo check failed for {} package(s); wrote {} bug report(s): {}",
+            "[verify] cargo verification failed for {} package(s); wrote {} bug report(s): {}",
             reports.bug_reports.len(),
             reports.bug_reports.len(),
             display_paths(&reports.bug_reports)
         );
     }
-    eprintln!("[test] skipped: run {package_list} for a full test report");
     Ok(())
 }
 
@@ -431,14 +434,6 @@ fn display_paths(paths: &[PathBuf]) -> String {
     paths
         .iter()
         .map(|path| path.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn test_report_commands(packages: &BTreeSet<String>) -> String {
-    packages
-        .iter()
-        .map(|pkg| format!("`cargo test -p {pkg}`"))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -491,7 +486,8 @@ fn run_cargo_report(
     args: &[&str],
 ) -> std::result::Result<(), Box<verify::CargoVerifyFailure>> {
     let command = format!("cargo {}", args.join(" "));
-    eprintln!("[check] {command}");
+    let phase = args.first().copied().unwrap_or("check");
+    eprintln!("[{phase}] {command}");
     let argv = cargo_argv_strings(args);
     let output = std::process::Command::new(cargo_program())
         .args(args)
@@ -504,15 +500,15 @@ fn run_cargo_report(
                 Some(manifest.to_path_buf()),
                 Vec::new(),
                 argv,
-                format!("[check] {command} failed to start: {e}"),
+                format!("[{phase}] {command} failed to start: {e}"),
             )));
         }
     };
     if output.status.success() {
-        eprintln!("[check] {command} ok");
+        eprintln!("[{phase}] {command} ok");
         return Ok(());
     }
-    eprintln!("[check] {command} failed");
+    eprintln!("[{phase}] {command} failed");
     if !output.stdout.is_empty() {
         eprintln!("--- {command} stdout ---");
         eprintln!("{}", String::from_utf8_lossy(&output.stdout));
