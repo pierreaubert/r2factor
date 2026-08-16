@@ -409,8 +409,199 @@ fn glob_prelude_hint_is_used(idents: &HashSet<String>) -> bool {
         || idents.contains("par_sort_unstable")
 }
 
+fn any_ident(idents: &HashSet<String>, names: &[&str]) -> bool {
+    names.iter().any(|name| idents.contains(*name))
+}
+
+fn any_prefixed_ident(idents: &HashSet<String>, prefixes: &[&str]) -> bool {
+    idents.iter().any(|ident| {
+        prefixes.iter().any(|prefix| {
+            ident == prefix
+                || ident
+                    .strip_prefix(prefix)
+                    .is_some_and(|suffix| suffix.starts_with('_'))
+        })
+    })
+}
+
+fn gpui_styled_method_hint_is_used(idents: &HashSet<String>) -> bool {
+    const METHODS: &[&str] = &[
+        "style",
+        "block",
+        "flex",
+        "grid",
+        "hidden",
+        "scrollbar_width",
+        "whitespace_normal",
+        "whitespace_nowrap",
+        "text_ellipsis",
+        "text_ellipsis_start",
+        "text_ellipsis_middle",
+        "text_overflow",
+        "text_align",
+        "text_left",
+        "text_center",
+        "text_right",
+        "truncate",
+        "line_clamp",
+        "flex_col",
+        "flex_col_reverse",
+        "flex_row",
+        "flex_row_reverse",
+        "flex_1",
+        "flex_auto",
+        "flex_initial",
+        "flex_none",
+        "flex_basis",
+        "flex_grow",
+        "flex_grow_0",
+        "flex_grow_1",
+        "flex_shrink",
+        "flex_shrink_0",
+        "flex_shrink_1",
+        "flex_wrap",
+        "flex_wrap_reverse",
+        "flex_nowrap",
+        "items_start",
+        "items_end",
+        "items_center",
+        "items_baseline",
+        "items_stretch",
+        "self_start",
+        "self_end",
+        "self_flex_start",
+        "self_flex_end",
+        "self_center",
+        "self_baseline",
+        "self_stretch",
+        "justify_start",
+        "justify_end",
+        "justify_center",
+        "justify_between",
+        "justify_around",
+        "justify_evenly",
+        "content_normal",
+        "content_center",
+        "content_start",
+        "content_end",
+        "content_between",
+        "content_around",
+        "content_evenly",
+        "content_stretch",
+        "aspect_ratio",
+        "aspect_square",
+        "bg",
+        "border_dashed",
+        "text_style",
+        "text_color",
+        "font_weight",
+        "text_bg",
+        "text_size",
+        "text_xs",
+        "text_sm",
+        "text_base",
+        "text_lg",
+        "text_xl",
+        "text_2xl",
+        "text_3xl",
+        "italic",
+        "not_italic",
+        "underline",
+        "line_through",
+        "text_decoration_none",
+        "text_decoration_color",
+        "text_decoration_solid",
+        "text_decoration_wavy",
+        "text_decoration_0",
+        "text_decoration_1",
+        "text_decoration_2",
+        "text_decoration_4",
+        "text_decoration_8",
+        "font_family",
+        "font_features",
+        "font",
+        "line_height",
+        "opacity",
+        "grid_cols",
+        "grid_cols_min_content",
+        "grid_cols_max_content",
+        "grid_rows",
+        "col_start",
+        "col_start_auto",
+        "col_end",
+        "col_end_auto",
+        "col_span",
+        "col_span_full",
+        "row_start",
+        "row_start_auto",
+        "row_end",
+        "row_end_auto",
+        "row_span",
+        "row_span_full",
+        "debug",
+        "debug_below",
+    ];
+    const GENERATED_PREFIXES: &[&str] = &[
+        "m",
+        "mt",
+        "mb",
+        "my",
+        "mx",
+        "ml",
+        "mr",
+        "p",
+        "pt",
+        "pb",
+        "px",
+        "py",
+        "pl",
+        "pr",
+        "inset",
+        "top",
+        "bottom",
+        "left",
+        "right",
+        "w",
+        "h",
+        "size",
+        "min_size",
+        "min_w",
+        "min_h",
+        "max_size",
+        "max_w",
+        "max_h",
+        "gap",
+        "gap_x",
+        "gap_y",
+        "rounded",
+        "rounded_t",
+        "rounded_b",
+        "rounded_r",
+        "rounded_l",
+        "rounded_tl",
+        "rounded_tr",
+        "rounded_bl",
+        "rounded_br",
+        "border",
+        "border_t",
+        "border_b",
+        "border_r",
+        "border_l",
+        "border_x",
+        "border_y",
+    ];
+    any_ident(idents, METHODS) || any_prefixed_ident(idents, GENERATED_PREFIXES)
+}
+
 fn trait_method_hint_is_used(binding: &str, idents: &HashSet<String>) -> bool {
     match binding {
+        // Unix extension traits are commonly imported once at a platform
+        // module's root and then used by methods/associated constructors in
+        // extracted child buckets. Their trait names do not appear in the
+        // child source, so retain the import when the provided method does.
+        "AsRawFd" => idents.contains("as_raw_fd"),
+        "FromRawFd" => idents.contains("from_raw_fd"),
+        "OsStringExt" => idents.contains("into_vec") || idents.contains("from_vec"),
         "Aead" => idents.contains("encrypt") || idents.contains("decrypt"),
         "AeadInPlace" => {
             idents.contains("encrypt_in_place")
@@ -547,6 +738,16 @@ fn trait_method_hint_is_used(binding: &str, idents: &HashSet<String>) -> bool {
                 || idents.contains("write_all")
         }
         "Context" => idents.contains("context") || idents.contains("with_context"),
+        "FutureExt" => idents.contains("boxed") || idents.contains("shared"),
+        "StreamExt" => idents.contains("next") || idents.contains("try_next"),
+        "Platform" => {
+            idents.contains("text_system")
+                || idents.contains("write_to_clipboard")
+                || idents.contains("read_from_clipboard")
+                || idents.contains("active_window")
+        }
+        "Deref" => idents.contains("deref"),
+        "BorrowAppContext" => idents.contains("update_global"),
         "FromStr" => idents.contains("from_str"),
         "ValueEnum" => idents.contains("from_str") || idents.contains("value_variants"),
         "KeyInit" => idents.contains("new") || idents.contains("new_from_slice"),
@@ -557,6 +758,8 @@ fn trait_method_hint_is_used(binding: &str, idents: &HashSet<String>) -> bool {
         "Zero" => {
             idents.contains("zero") || idents.contains("is_zero") || idents.contains("set_zero")
         }
+        "IsZero" => idents.contains("is_zero"),
+        "Refineable" => idents.contains("refine") || idents.contains("refined"),
         "UnicodeSegmentation" => {
             idents.contains("split_word_bound_indices")
                 || idents.contains("split_word_bounds")
@@ -590,10 +793,124 @@ fn trait_method_hint_is_used(binding: &str, idents: &HashSet<String>) -> bool {
                 || idents.contains("find_or_last")
                 || idents.contains("collect_vec")
                 || idents.contains("join")
+                || idents.contains("sorted")
+                || idents.contains("fold_while")
         }
+        "TaffyGridLine" => idents.contains("from_line_index"),
+        "TaffyGridSpan" => idents.contains("from_span"),
+        "AnimationDecoder" => idents.contains("into_frames"),
+        "Half" => idents.contains("half"),
         "Scale" => idents.contains("invert"),
         "DesignExt" => idents.contains("design"),
         "AppContext" => idents.contains("new"),
+        "Styled" => gpui_styled_method_hint_is_used(idents),
+        "StyledImage" => any_ident(
+            idents,
+            &[
+                "image_style",
+                "grayscale",
+                "object_fit",
+                "with_fallback",
+                "with_loading",
+            ],
+        ),
+        "ParentElement" => any_ident(idents, &["extend", "child", "children"]),
+        "InteractiveElement" => any_ident(
+            idents,
+            &[
+                "interactivity",
+                "group",
+                "id",
+                "track_focus",
+                "tab_stop",
+                "tab_index",
+                "tab_group",
+                "key_context",
+                "hover",
+                "group_hover",
+                "on_mouse_down",
+                "debug_selector",
+                "capture_any_mouse_down",
+                "on_any_mouse_down",
+                "on_mouse_up",
+                "capture_any_mouse_up",
+                "on_mouse_pressure",
+                "capture_mouse_pressure",
+                "on_mouse_down_out",
+                "on_mouse_up_out",
+                "on_mouse_move",
+                "on_drag_move",
+                "on_scroll_wheel",
+                "on_pinch",
+                "capture_pinch",
+                "capture_action",
+                "on_action",
+                "on_boxed_action",
+                "on_key_down",
+                "capture_key_down",
+                "on_key_up",
+                "capture_key_up",
+                "on_modifiers_changed",
+                "drag_over",
+                "group_drag_over",
+                "on_drop",
+                "can_drop",
+                "occlude",
+                "window_control_area",
+                "block_mouse_except_scroll",
+                "focus",
+                "in_focus",
+                "focus_visible",
+            ],
+        ),
+        "StatefulInteractiveElement" => any_ident(
+            idents,
+            &[
+                "role",
+                "aria_label",
+                "aria_active_descendant",
+                "a11y_synthetic_children",
+                "aria_selected",
+                "aria_expanded",
+                "aria_toggled",
+                "aria_numeric_value",
+                "aria_numeric_value_step",
+                "aria_value",
+                "aria_placeholder",
+                "aria_min_numeric_value",
+                "aria_max_numeric_value",
+                "aria_orientation",
+                "aria_level",
+                "aria_position_in_set",
+                "aria_size_of_set",
+                "aria_row_index",
+                "aria_column_index",
+                "aria_row_count",
+                "aria_column_count",
+                "on_a11y_action",
+                "focusable",
+                "overflow_scroll",
+                "overflow_x_scroll",
+                "overflow_y_scroll",
+                "track_scroll",
+                "anchor_scroll",
+                "active",
+                "group_active",
+                "on_click",
+                "on_aux_click",
+                "on_drag",
+                "on_hover",
+                "tooltip",
+                "hoverable_tooltip",
+                "tooltip_show_delay",
+            ],
+        ),
+        "IntoElement" => any_ident(idents, &["into_element", "into_any_element"]),
+        "RenderOnce" | "Render" => idents.contains("render"),
+        "FluentBuilder" => any_ident(
+            idents,
+            &["map", "when", "when_else", "when_some", "when_none"],
+        ),
         "PlayerAdapter" => {
             idents.contains("current_song")
                 || idents.contains("next")
@@ -1332,6 +1649,135 @@ mod tests {
         assert!(rendered.contains("HostTrait"), "rendered={rendered}");
         assert!(rendered.contains("StreamTrait"), "rendered={rendered}");
         assert!(rendered.contains("Sample"), "rendered={rendered}");
+    }
+
+    #[test]
+    fn gpui_prelude_extension_traits_survive_method_syntax() {
+        use crate::item::{ItemKind, ItemVis, ParsedItem};
+        use std::collections::HashSet;
+
+        let prelude_use = ParsedItem {
+            id: 0,
+            kind: ItemKind::Use,
+            name: String::new(),
+            vis: ItemVis::Private,
+            is_cfg_test: false,
+            line_start: 1,
+            line_end: 1,
+            source: "use gpui::prelude::{FluentBuilder, InteractiveElement, IntoElement, ParentElement, Render, RenderOnce, StatefulInteractiveElement, Styled, StyledImage};".to_string(),
+            refs: Vec::new(),
+        };
+        let idents = HashSet::from([
+            "absolute".to_string(),
+            "aria_selected".to_string(),
+            "child".to_string(),
+            "debug_selector".to_string(),
+            "font_family".to_string(),
+            "gap_1".to_string(),
+            "grayscale".to_string(),
+            "id".to_string(),
+            "into_element".to_string(),
+            "render".to_string(),
+            "text_color".to_string(),
+            "when_some".to_string(),
+        ]);
+
+        let rendered = render_uses_for(&[&prelude_use], &idents, &HashSet::new(), false);
+
+        for binding in [
+            "FluentBuilder",
+            "InteractiveElement",
+            "IntoElement",
+            "ParentElement",
+            "Render",
+            "RenderOnce",
+            "StatefulInteractiveElement",
+            "Styled",
+            "StyledImage",
+        ] {
+            assert!(
+                rendered.contains(binding),
+                "{binding} was pruned from rendered imports: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn reported_platform_and_dependency_traits_survive_method_syntax() {
+        use crate::item::{ItemKind, ItemVis, ParsedItem};
+        use std::collections::HashSet;
+
+        let cases = [
+            (
+                "use std::os::fd::{AsRawFd, FromRawFd};",
+                &["as_raw_fd", "from_raw_fd"][..],
+                &["AsRawFd", "FromRawFd"][..],
+            ),
+            (
+                "use std::os::unix::ffi::OsStringExt;",
+                &["into_vec"][..],
+                &["OsStringExt"][..],
+            ),
+            (
+                "use futures::FutureExt;",
+                &["boxed"][..],
+                &["FutureExt"][..],
+            ),
+            ("use futures::StreamExt;", &["next"][..], &["StreamExt"][..]),
+            (
+                "use gpui::{BorrowAppContext, Platform};",
+                &["update_global", "text_system"][..],
+                &["BorrowAppContext", "Platform"][..],
+            ),
+            ("use std::ops::Deref;", &["deref"][..], &["Deref"][..]),
+            ("use num_traits::IsZero;", &["is_zero"][..], &["IsZero"][..]),
+            (
+                "use refineable::Refineable;",
+                &["refine"][..],
+                &["Refineable"][..],
+            ),
+            (
+                "use itertools::Itertools;",
+                &["sorted", "fold_while"][..],
+                &["Itertools"][..],
+            ),
+            (
+                "use taffy::{TaffyGridLine, TaffyGridSpan};",
+                &["from_line_index", "from_span"][..],
+                &["TaffyGridLine", "TaffyGridSpan"][..],
+            ),
+            (
+                "use gpui::AnimationDecoder;",
+                &["into_frames"][..],
+                &["AnimationDecoder"][..],
+            ),
+            ("use half::Half;", &["half"][..], &["Half"][..]),
+        ];
+
+        for (source, methods, expected) in cases {
+            let item = ParsedItem {
+                id: 0,
+                kind: ItemKind::Use,
+                name: String::new(),
+                vis: ItemVis::Private,
+                is_cfg_test: false,
+                line_start: 1,
+                line_end: 1,
+                source: source.to_string(),
+                refs: Vec::new(),
+            };
+            let idents = methods
+                .iter()
+                .map(|method| (*method).to_string())
+                .collect::<HashSet<_>>();
+            let rendered = render_uses_for(&[&item], &idents, &HashSet::new(), false);
+            for binding in expected {
+                assert!(
+                    rendered.contains(binding),
+                    "{binding} was pruned from `{source}` for methods {methods:?}: {rendered}"
+                );
+            }
+        }
     }
 
     #[test]

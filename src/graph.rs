@@ -124,8 +124,46 @@ fn scan_token_stream(stream: &proc_macro2::TokenStream, v: &mut RefVisitor) {
         match tt {
             TokenTree::Ident(id) => v.visit_ident(&id),
             TokenTree::Group(g) => scan_token_stream(&g.stream(), v),
+            TokenTree::Literal(lit) => scan_format_literal(&lit, v),
             _ => {}
         }
+    }
+}
+
+/// Named captures in `format!`-style string literals are not represented as
+/// identifier tokens (`"{EXPECTED_LENGTH}"` is just one literal to `syn`).
+/// Scan the literal conservatively so private constants and helpers used by
+/// implicit captures still receive cross-bucket imports.
+fn scan_format_literal(lit: &proc_macro2::Literal, v: &mut RefVisitor) {
+    let Ok(lit) = syn::parse_str::<syn::LitStr>(&lit.to_string()) else {
+        return;
+    };
+    let chars: Vec<char> = lit.value().chars().collect();
+    let mut ix = 0;
+    while ix < chars.len() {
+        if chars[ix] != '{' {
+            ix += 1;
+            continue;
+        }
+        if chars.get(ix + 1) == Some(&'{') {
+            ix += 2;
+            continue;
+        }
+        let start = ix + 1;
+        let mut end = start;
+        while end < chars.len() && chars[end] != '}' && chars[end] != ':' {
+            end += 1;
+        }
+        let name: String = chars[start..end].iter().collect();
+        let name = name.trim();
+        if !name.is_empty()
+            && name.chars().enumerate().all(|(pos, ch)| {
+                ch == '_' || ch.is_ascii_alphanumeric() && (pos > 0 || !ch.is_ascii_digit())
+            })
+        {
+            v.record_ident(name);
+        }
+        ix = end.saturating_add(1);
     }
 }
 
@@ -168,6 +206,25 @@ struct Config {
             config.refs.iter().any(|r| r == "default_gain"),
             "Config should ref serde string default; refs={:?}",
             config.refs
+        );
+    }
+
+    #[test]
+    fn refs_from_format_string_captures_are_counted() {
+        let src = r#"
+const EXPECTED: &str = "expected";
+
+fn render() -> String {
+    format!("invalid, expected {EXPECTED}")
+}
+"#;
+        let mut items = parse_file(src).unwrap();
+        annotate_refs(&mut items, None);
+        let render = items.iter().find(|i| i.name == "render").unwrap();
+        assert!(
+            render.refs.iter().any(|r| r == "EXPECTED"),
+            "format capture should ref EXPECTED; refs={:?}",
+            render.refs
         );
     }
 }

@@ -448,6 +448,62 @@ fn parser_lexer_integration_test() {
 }
 
 #[test]
+fn cfg_test_shared_declaration_and_unwrapped_tests_module_compile() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let file = tmp.path().join("tree.rs");
+    let target = tmp.path().join("tree");
+    fs::write(
+        &file,
+        r#"#[cfg(test)]
+pub const TREE_BASE: usize = 2;
+
+#[cfg(not(test))]
+pub const TREE_BASE: usize = 6;
+
+pub struct Tree;
+
+pub fn capacity() -> usize {
+    TREE_BASE * 2
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn capacity_uses_test_tree_base() {
+        assert_eq!(super::capacity(), 4);
+        let _ = super::Tree;
+    }
+}
+"#,
+    )
+    .expect("write source");
+    fs::create_dir_all(&target).expect("mkdir target");
+    fs::write(target.join("cursor.rs"), "use super::*;\n").expect("write sibling");
+
+    run_split(
+        &file,
+        SplitOptions {
+            use_tokensave: false,
+            llm: None,
+            write: Some(WriteOptions {
+                force: false,
+                recursive_max_lines: Some(0),
+            }),
+        },
+    )
+    .expect("split tree.rs");
+
+    let facade = fs::read_to_string(&file).expect("read facade");
+    assert!(facade.contains("mod tests;"), "facade={facade}");
+    assert!(
+        !facade.contains("tests::tests"),
+        "unwrapped inline test modules must not become self-imports: {facade}"
+    );
+    compile_check(tmp.path(), "tree");
+    compile_test_check(tmp.path(), "tree");
+}
+
+#[test]
 fn external_module_crate_root_private_refs_survive_lib_split() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let lib = tmp.path().join("lib.rs");
@@ -1964,6 +2020,155 @@ pub fn call_abs(input: i32) -> i32 {
         "foreign block should stay in generated bucket; got:\n{misc}"
     );
     compile_check(tmp.path(), "demo");
+}
+
+#[test]
+fn custom_crate_root_preserves_existing_super_glob_trait_scope() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let src_dir = tmp.path().join("src");
+    fs::create_dir_all(&src_dir).expect("mkdir src");
+    fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[package]\nname = \"custom-root-glob\"\nversion = \"0.1.0\"\n\n[lib]\npath = \"src/custom.rs\"\n",
+    )
+    .expect("write manifest");
+    fs::write(
+        src_dir.join("sibling.rs"),
+        "use super::*;\n\npub fn exercise() {\n    let result: Result<(), ()> = Ok(());\n    result.unwrap_oob();\n}\n",
+    )
+    .expect("write sibling.rs");
+    let original = src_dir.join("custom.rs");
+    fs::write(
+        &original,
+        "mod sibling;\n\ntrait CapacityResultExt {\n    fn unwrap_oob(self);\n}\n\nimpl<T> CapacityResultExt for Result<(), T> {\n    fn unwrap_oob(self) {}\n}\n",
+    )
+    .expect("write custom.rs");
+
+    run_split(
+        &original,
+        SplitOptions {
+            use_tokensave: false,
+            llm: None,
+            write: Some(WriteOptions {
+                force: false,
+                recursive_max_lines: Some(0),
+            }),
+        },
+    )
+    .expect("split custom crate root");
+
+    let facade = fs::read_to_string(&original).expect("read custom facade");
+    assert!(
+        facade.contains("use capacity_result_ext::CapacityResultExt;"),
+        "existing sibling glob should keep the moved trait in facade scope; got:\n{facade}"
+    );
+    compile_lib_root(&original);
+}
+
+#[test]
+fn extracted_platform_child_keeps_unix_traits_and_foreign_items() {
+    let src = r#"
+use std::ffi::OsString;
+use std::fs::File;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+unsafe extern "C" {
+    fn abs(input: i32) -> i32;
+}
+
+pub struct Child;
+
+impl Child {
+    pub fn run(&self, program: OsString, file: &File) -> usize {
+        let path_len = program.as_os_str().as_bytes().len();
+        let owned_len = program.into_vec().len();
+        let _ = unsafe { File::from_raw_fd(file.as_raw_fd()) };
+        path_len + owned_len + unsafe { abs(1) as usize }
+    }
+}
+"#;
+    let (tmp, _facade, sub_dir) = split_in_tempdir("darwin", src);
+    let child = fs::read_to_string(sub_dir.join("child.rs")).expect("read child.rs");
+    assert!(
+        child.contains("use super::misc::abs;"),
+        "child should import the foreign declaration from its sibling bucket; got:\n{child}"
+    );
+    assert!(
+        child.contains("use std::os::fd::{AsRawFd, FromRawFd};")
+            && child.contains("use std::os::unix::ffi::{OsStrExt, OsStringExt};"),
+        "child should retain Unix extension-trait imports; got:\n{child}"
+    );
+    compile_check(tmp.path(), "darwin");
+}
+
+#[test]
+fn nested_tests_directory_facade_uses_path_for_in_place_children() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let source_dir = tmp.path().join("src/line_break/tests");
+    fs::create_dir_all(&source_dir).expect("mkdir nested tests directory");
+    let original = source_dir.join("misc.rs");
+    fs::write(
+        &original,
+        r#"pub struct Misc;
+
+pub fn first() -> usize { 1 }
+pub fn second() -> usize { 2 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn smoke() {
+        assert_eq!(super::first() + super::second(), 3);
+        let _ = super::Misc;
+    }
+}
+"#,
+    )
+    .expect("write nested source");
+
+    run_split(
+        &original,
+        SplitOptions {
+            use_tokensave: false,
+            llm: None,
+            write: Some(WriteOptions {
+                force: false,
+                recursive_max_lines: Some(0),
+            }),
+        },
+    )
+    .expect("split nested tests source");
+
+    let facade = fs::read_to_string(&original).expect("read nested facade");
+    assert!(
+        facade.contains("#[path = \"tests.rs\"]\nmod tests;"),
+        "nested in-place children need an explicit path from misc.rs: {facade}"
+    );
+    assert!(source_dir.join("tests.rs").exists());
+
+    let lib = tmp.path().join("src/lib.rs");
+    fs::write(
+        &lib,
+        "#![allow(warnings)]\n#[path = \"line_break/tests/misc.rs\"]\npub mod misc;\n",
+    )
+    .expect("write test crate root");
+    let out_dir = tmp.path().join("rustc-test-out");
+    fs::create_dir_all(&out_dir).expect("mkdir rustc test output");
+    let output = Command::new("rustc")
+        .arg("--edition=2024")
+        .arg("--test")
+        .arg("-Awarnings")
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .arg(&lib)
+        .output()
+        .expect("invoke rustc --test");
+    assert!(
+        output.status.success(),
+        "nested in-place split failed to compile as a test crate: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

@@ -29,9 +29,26 @@ pub const PASSES: &[(&str, Pass)] = &[
 
 pub fn build(items: &[ParsedItem]) -> Plan {
     let mut plan = Plan::default();
+    // A `#[cfg(test)]` declaration can still be part of the module-level API
+    // used by non-test items. The classic example is a pair of cfg-selected
+    // constants: production code refers to the name unconditionally while
+    // the test build selects the test value. Keep that test-side declaration
+    // at the module root so child buckets can see it through `use super::*`.
+    let cfg_test_names: BTreeSet<String> = items
+        .iter()
+        .filter(|i| i.is_cfg_test && !i.name.is_empty())
+        .map(|i| i.name.clone())
+        .collect();
+    let shared_cfg_test_names: BTreeSet<String> = items
+        .iter()
+        .filter(|i| !is_test_item(i))
+        .flat_map(|i| i.refs.iter())
+        .filter(|name| cfg_test_names.contains(*name))
+        .cloned()
+        .collect();
     let test_ids: BTreeSet<ItemId> = items
         .iter()
-        .filter(|i| is_test_item(i))
+        .filter(|i| is_test_item(i) && !(i.is_cfg_test && shared_cfg_test_names.contains(&i.name)))
         .map(|i| i.id)
         .collect();
     let mut unassigned: BTreeSet<ItemId> = items

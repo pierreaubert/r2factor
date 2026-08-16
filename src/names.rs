@@ -46,17 +46,46 @@ pub fn type_to_module_name(ty: &str) -> String {
     }
     let mut out = String::with_capacity(ty.len() + 4);
     let mut prev_lower = false;
+    let mut pending_separator = false;
     for ch in ty.chars() {
-        if ch.is_ascii_uppercase() {
-            if prev_lower {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            if pending_separator && !out.is_empty() && !out.ends_with('_') {
                 out.push('_');
             }
-            out.push(ch.to_ascii_lowercase());
+            pending_separator = false;
+            if ch.is_ascii_uppercase() {
+                if prev_lower && !out.ends_with('_') {
+                    out.push('_');
+                }
+                out.push(ch.to_ascii_lowercase());
+                prev_lower = false;
+            } else {
+                out.push(ch);
+                prev_lower = ch.is_ascii_lowercase() || ch.is_ascii_digit();
+            }
+        } else if !out.is_empty() {
+            // Impl self types can be references, trait objects, or include
+            // lifetimes and generic punctuation. Their token text is useful
+            // as a clustering hint, but cannot be emitted as a Rust module
+            // identifier verbatim. Treat runs of punctuation as one
+            // separator and omit leading/trailing separators.
+            pending_separator = true;
             prev_lower = false;
-        } else {
-            out.push(ch);
-            prev_lower = ch.is_ascii_lowercase() || ch.is_ascii_digit();
         }
+    }
+    if ty
+        .chars()
+        .any(|ch| !ch.is_ascii_alphanumeric() && ch != '_')
+    {
+        while out.ends_with('_') {
+            out.pop();
+        }
+    }
+    if out.is_empty() {
+        return "misc".to_string();
+    }
+    if out.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+        out.insert(0, '_');
     }
     escape_keyword(&out)
 }
@@ -116,5 +145,16 @@ mod tests {
         assert_eq!(type_to_module_name("tries"), "tries");
         assert_eq!(type_to_module_name("matcher"), "matcher");
         assert_eq!(sanitize_module("trying"), "trying");
+    }
+
+    #[test]
+    fn type_syntax_becomes_a_valid_module_name() {
+        assert_eq!(type_to_module_name("&'static str"), "static_str");
+        assert_eq!(
+            type_to_module_name("dyn AsCacheKeyRef + '_"),
+            "dyn_as_cache_key_ref"
+        );
+        assert_eq!(type_to_module_name("Vec<Foo::Bar>"), "vec_foo_bar");
+        assert_eq!(type_to_module_name("123Type"), "_123_type");
     }
 }

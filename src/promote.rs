@@ -663,6 +663,16 @@ pub fn compute_facade_imports(
                 if !is_cross_importable(target) {
                     continue;
                 }
+                // An inline module whose bucket has the same name is
+                // unwrapped into that bucket's file. The facade already
+                // declares `mod <name>;`, so importing `<name>` from
+                // `<name>` would incorrectly produce `use <name>::<name>;`
+                // (for example, `use tests::tests;`).
+                if matches!(target.kind, crate::item::ItemKind::Mod)
+                    && target.name == target_bucket.as_str()
+                {
+                    continue;
+                }
                 out.insert(CrossImport {
                     source_bucket: Some((*target_bucket).clone()),
                     name: target.name.clone(),
@@ -1234,6 +1244,27 @@ mod tests {
         let cross = compute_cross_imports(&ctx, &items, &promote, "sample");
         assert!(!cross.contains_key("sample"));
         assert!(!cross.contains_key("mod_root"));
+    }
+
+    #[test]
+    fn facade_does_not_import_unwrapped_inline_module_from_same_named_bucket() {
+        let mut tests_module = fake(0, "tests", ItemVis::Private, ItemKind::Mod, &[]);
+        tests_module.is_cfg_test = true;
+        let primary = fake(1, "Primary", ItemVis::Public, ItemKind::Struct, &["tests"]);
+        let items = vec![tests_module, primary];
+        let mut plan = Plan::default();
+        plan.assign("tests", 0, "");
+        plan.assign("sample", 1, "");
+
+        let ctx = RefContext::new(&plan, &items);
+        let promote = compute_promotions(&ctx, &items, "sample");
+        assert!(promote.contains(&0));
+
+        let facade_imports = compute_facade_imports(&ctx, &items, &promote, "sample");
+        assert!(
+            facade_imports.iter().all(|import| import.name != "tests"),
+            "facade must not emit `use tests::tests;`: {facade_imports:?}"
+        );
     }
 
     #[test]
